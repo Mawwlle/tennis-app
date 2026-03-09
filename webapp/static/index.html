@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tennis Annotation Tool</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1a1a2e; color: #e0e0e0; height: 100vh; display: flex; flex-direction: column; }
+
+  header { background: #16213e; padding: 10px 20px; display: flex; align-items: center; gap: 14px; border-bottom: 1px solid #0f3460; }
+  header h1 { font-size: 17px; color: #e94560; white-space: nowrap; }
+  header select { background: #0f3460; color: #e0e0e0; border: 1px solid #533483; padding: 5px 10px; border-radius: 4px; font-size: 13px; min-width: 280px; }
+
+  .mode-toggle { display: flex; border: 1px solid #533483; border-radius: 4px; overflow: hidden; margin-left: auto; }
+  .mode-btn { padding: 5px 16px; font-size: 13px; cursor: pointer; border: none; background: #0f3460; color: #aaa; }
+  .mode-btn.active { background: #533483; color: #fff; }
+
+  .main { display: flex; flex: 1; overflow: hidden; }
+
+  .viewer { flex: 1; display: flex; flex-direction: column; padding: 12px; gap: 10px; min-width: 0; }
+  .frame-container { flex: 1; display: flex; align-items: center; justify-content: center; background: #0a0a1a; border-radius: 8px; overflow: hidden; position: relative; }
+  .frame-container img { max-width: 100%; max-height: 100%; object-fit: contain; display: block; }
+  .frame-container .no-video { color: #666; font-size: 16px; }
+  .frame-container canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+  .frame-container.ball-mode canvas { pointer-events: auto; cursor: crosshair; }
+  .frame-container.ball-mode img { pointer-events: none; }
+
+  .controls { display: flex; align-items: center; gap: 10px; }
+  .controls .frame-info { font-size: 13px; color: #aaa; min-width: 130px; }
+  .controls input[type=range] { flex: 1; accent-color: #e94560; }
+  .controls button { background: #0f3460; color: #e0e0e0; border: 1px solid #533483; padding: 5px 12px; border-radius: 4px; cursor: pointer; font-size: 13px; }
+  .controls button:hover { background: #533483; }
+
+  .hint-bar { display: flex; gap: 12px; flex-wrap: wrap; justify-content: center; padding: 6px 10px; background: #16213e; border-radius: 6px; font-size: 12px; }
+  .hint-bar kbd { background: #0f3460; padding: 1px 6px; border-radius: 3px; border: 1px solid #533483; font-family: monospace; }
+  .hint-bar .sep { color: #444; }
+
+  .timelines { display: flex; flex-direction: column; gap: 4px; }
+  .timeline-row { display: flex; align-items: center; gap: 8px; font-size: 11px; color: #666; }
+  .timeline-row span { width: 36px; text-align: right; flex-shrink: 0; }
+  .timeline { flex: 1; height: 18px; background: #0a0a1a; border-radius: 3px; position: relative; cursor: pointer; }
+  .timeline .marker { position: absolute; top: 0; width: 3px; height: 100%; border-radius: 1px; }
+  .timeline .marker.net { background: #e94560; }
+  .timeline .marker.bounce { background: #00d2ff; }
+  .timeline .marker.hit { background: #ffd700; }
+  .timeline .marker.ball { background: #00ff88; width: 2px; }
+  .timeline .marker.ball-hidden { background: #555; width: 2px; }
+  .timeline .current { position: absolute; top: 0; width: 2px; height: 100%; background: #fff; pointer-events: none; }
+
+  .sidebar { width: 260px; background: #16213e; border-left: 1px solid #0f3460; display: flex; flex-direction: column; flex-shrink: 0; }
+  .sidebar-tabs { display: flex; border-bottom: 1px solid #0f3460; }
+  .tab-btn { flex: 1; padding: 10px; font-size: 13px; cursor: pointer; border: none; background: none; color: #aaa; border-bottom: 2px solid transparent; }
+  .tab-btn.active { color: #fff; border-bottom-color: #533483; }
+  .tab-content { display: none; flex: 1; flex-direction: column; overflow: hidden; }
+  .tab-content.active { display: flex; }
+
+  .annotation-list { flex: 1; overflow-y: auto; }
+  .annotation-item { display: flex; align-items: center; justify-content: space-between; padding: 7px 14px; border-bottom: 1px solid #0f3460; cursor: pointer; font-size: 12px; }
+  .annotation-item:hover { background: #1a1a3e; }
+  .annotation-item .label { font-weight: 600; }
+  .annotation-item .label.net { color: #e94560; }
+  .annotation-item .label.bounce { color: #00d2ff; }
+  .annotation-item .label.hit { color: #ffd700; }
+  .annotation-item .label.ball { color: #00ff88; }
+  .annotation-item .label.hidden { color: #666; }
+  .annotation-item .src-badge { font-size: 10px; color: #666; background: #0f3460; padding: 1px 5px; border-radius: 3px; }
+  .annotation-item .delete-btn { background: none; border: none; color: #555; cursor: pointer; font-size: 15px; padding: 2px 5px; flex-shrink: 0; }
+  .annotation-item .delete-btn:hover { color: #e94560; }
+
+  .stats { padding: 10px 14px; border-top: 1px solid #0f3460; font-size: 11px; color: #777; }
+
+  .detect-status { padding: 8px 14px; font-size: 12px; border-bottom: 1px solid #0f3460; min-height: 34px; display: flex; align-items: center; gap: 8px; }
+  .detect-status .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .detect-status .dot.found { background: #00ff88; }
+  .detect-status .dot.not-found { background: #555; }
+  .detect-status .dot.pending { background: #ffd700; animation: pulse 1s infinite; }
+  @keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:.3 } }
+
+  .auto-markup-bar { padding: 8px 14px; border-bottom: 1px solid #0f3460; display: flex; flex-direction: column; gap: 6px; }
+  .auto-markup-bar button { background: #533483; color: #fff; border: none; padding: 7px 0; border-radius: 4px; cursor: pointer; font-size: 13px; width: 100%; }
+  .auto-markup-bar button:hover:not(:disabled) { background: #6a45a0; }
+  .auto-markup-bar button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .auto-markup-progress { font-size: 11px; color: #aaa; display: none; }
+  .auto-markup-progress .bar-track { height: 4px; background: #0f3460; border-radius: 2px; margin-top: 4px; }
+  .auto-markup-progress .bar-fill { height: 100%; background: #533483; border-radius: 2px; width: 0%; transition: width 0.3s; animation: indeterminate 1.5s infinite linear; }
+  @keyframes indeterminate { 0% { margin-left:0; width:30% } 50% { margin-left:50%; width:40% } 100% { margin-left:100%; width:0% } }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Tennis Annotator</h1>
+  <select id="videoSelect"><option value="">Select a video...</option></select>
+  <div class="mode-toggle">
+    <button class="mode-btn active" id="modeEvent">Events</button>
+    <button class="mode-btn" id="modeBall">Ball</button>
+  </div>
+</header>
+
+<div class="main">
+  <div class="viewer">
+    <div class="frame-container" id="frameContainer">
+      <img id="frameImg" style="display:none" />
+      <canvas id="overlay"></canvas>
+      <span class="no-video" id="placeholder">Select a video to begin</span>
+    </div>
+
+    <div class="timelines">
+      <div class="timeline-row">
+        <span>events</span>
+        <div class="timeline" id="timelineEvents"></div>
+      </div>
+      <div class="timeline-row">
+        <span>ball</span>
+        <div class="timeline" id="timelineBall"></div>
+      </div>
+    </div>
+
+    <div class="controls">
+      <button id="prevBtn">&larr;</button>
+      <span class="frame-info" id="frameInfo">Frame: — / —</span>
+      <input type="range" id="frameSlider" min="0" max="0" value="0" />
+      <button id="nextBtn">&rarr;</button>
+    </div>
+
+    <div class="hint-bar" id="hintBar">
+      <span><kbd>←</kbd>/<kbd>→</kbd> ±1</span>
+      <span><kbd>Shift+←/→</kbd> ±10</span>
+      <span class="sep">|</span>
+      <span><kbd>N</kbd> <span style="color:#e94560">Net</span></span>
+      <span><kbd>B</kbd> <span style="color:#00d2ff">Bounce</span></span>
+      <span><kbd>H</kbd> <span style="color:#ffd700">Hit</span></span>
+    </div>
+  </div>
+
+  <div class="sidebar">
+    <div class="sidebar-tabs">
+      <button class="tab-btn active" id="tabEvents">Events</button>
+      <button class="tab-btn" id="tabBall">Ball</button>
+    </div>
+
+    <!-- Events tab -->
+    <div class="tab-content active" id="panelEvents">
+      <div class="annotation-list" id="annotationList"></div>
+      <div class="stats" id="statsEvents">No annotations</div>
+    </div>
+
+    <!-- Ball tab -->
+    <div class="tab-content" id="panelBall">
+      <div class="detect-status" id="detectStatus">
+        <span class="dot not-found"></span><span>—</span>
+      </div>
+      <div class="auto-markup-bar">
+        <button id="autoMarkupBtn" disabled>Auto-markup full video</button>
+        <div class="auto-markup-progress" id="autoMarkupProgress">
+          <span id="autoMarkupText">Running TrackNet…</span>
+          <div class="bar-track"><div class="bar-fill" id="autoMarkupBar"></div></div>
+        </div>
+      </div>
+      <div class="annotation-list" id="ballList"></div>
+      <div class="stats" id="statsBall">No ball annotations</div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── State ────────────────────────────────────────────────────────────────────
+let currentVideoId = null;
+let currentFrame = 0;
+let totalFrames = 0;
+let frameOrigW = 0, frameOrigH = 0;
+let mode = 'event'; // 'event' | 'ball'
+
+let eventAnnotations = [];
+let ballAnnotations = [];
+let pendingDetection = null; // {cx, cy, x0, y0, x1, y1, conf} in orig coords
+
+// ── DOM refs ─────────────────────────────────────────────────────────────────
+const videoSelect   = document.getElementById('videoSelect');
+const frameImg      = document.getElementById('frameImg');
+const overlay       = document.getElementById('overlay');
+const ctx           = overlay.getContext('2d');
+const placeholder   = document.getElementById('placeholder');
+const frameSlider   = document.getElementById('frameSlider');
+const frameInfo     = document.getElementById('frameInfo');
+const timelineE     = document.getElementById('timelineEvents');
+const timelineB     = document.getElementById('timelineBall');
+const annotationList= document.getElementById('annotationList');
+const ballList      = document.getElementById('ballList');
+const statsEvents   = document.getElementById('statsEvents');
+const statsBall     = document.getElementById('statsBall');
+const detectStatus  = document.getElementById('detectStatus');
+const frameContainer= document.getElementById('frameContainer');
+const hintBar       = document.getElementById('hintBar');
+
+// ── Mode switch ───────────────────────────────────────────────────────────────
+function setMode(m) {
+  mode = m;
+  document.getElementById('modeEvent').classList.toggle('active', m === 'event');
+  document.getElementById('modeBall').classList.toggle('active', m === 'ball');
+  document.getElementById('tabEvents').classList.toggle('active', m === 'event');
+  document.getElementById('tabBall').classList.toggle('active', m === 'ball');
+  document.getElementById('panelEvents').classList.toggle('active', m === 'event');
+  document.getElementById('panelBall').classList.toggle('active', m === 'ball');
+  frameContainer.classList.toggle('ball-mode', m === 'ball');
+  hintBar.innerHTML = m === 'event'
+    ? `<span><kbd>←</kbd>/<kbd>→</kbd> ±1</span><span><kbd>Shift+←/→</kbd> ±10</span>
+       <span class="sep">|</span>
+       <span><kbd>N</kbd> <span style="color:#e94560">Net</span></span>
+       <span><kbd>B</kbd> <span style="color:#00d2ff">Bounce</span></span>
+       <span><kbd>H</kbd> <span style="color:#ffd700">Hit</span></span>`
+    : `<span><kbd>←</kbd>/<kbd>→</kbd> ±1</span><span><kbd>Shift+←/→</kbd> ±10</span>
+       <span class="sep">|</span>
+       <span><kbd>Space</kbd> accept YOLO</span>
+       <span><kbd>V</kbd> not visible</span>
+       <span><kbd>Esc</kbd> clear</span>
+       <span>click = place manually</span>`;
+  drawOverlay();
+}
+document.getElementById('modeEvent').addEventListener('click', () => setMode('event'));
+document.getElementById('modeBall').addEventListener('click', () => setMode('ball'));
+document.getElementById('tabEvents').addEventListener('click', () => setMode('event'));
+document.getElementById('tabBall').addEventListener('click', () => setMode('ball'));
+
+// ── Video loading ─────────────────────────────────────────────────────────────
+async function loadVideos() {
+  const videos = await fetch('/api/videos').then(r => r.json());
+  videos.forEach(v => {
+    const opt = document.createElement('option');
+    opt.value = v.video_id;
+    opt.textContent = `[${v.category}] ${v.filename}`;
+    videoSelect.appendChild(opt);
+  });
+}
+
+async function selectVideo(videoId) {
+  if (!videoId) return;
+  currentVideoId = videoId;
+  currentFrame = 0;
+  document.getElementById('autoMarkupBtn').disabled = false;
+  document.getElementById('autoMarkupProgress').style.display = 'none';
+  const info = await fetch(`/api/videos/${enc(videoId)}/info`).then(r => r.json());
+  totalFrames = info.frame_count;
+  frameOrigW  = info.width;
+  frameOrigH  = info.height;
+  frameSlider.max = totalFrames - 1;
+  frameSlider.value = 0;
+  await Promise.all([loadEventAnnotations(), loadBallAnnotations()]);
+  showFrame(0);
+}
+
+videoSelect.addEventListener('change', () => selectVideo(videoSelect.value));
+
+// ── Frame display ─────────────────────────────────────────────────────────────
+function showFrame(idx) {
+  if (!currentVideoId) return;
+  currentFrame = Math.max(0, Math.min(idx, totalFrames - 1));
+  pendingDetection = null;
+
+  frameImg.src = `/api/videos/${enc(currentVideoId)}/frame/${currentFrame}`;
+  frameImg.style.display = 'block';
+  placeholder.style.display = 'none';
+  frameSlider.value = currentFrame;
+  frameInfo.textContent = `Frame: ${currentFrame} / ${totalFrames - 1}`;
+  updateTimelines();
+  drawOverlay();
+
+  if (mode === 'ball') runDetection(currentFrame);
+}
+
+frameImg.addEventListener('load', () => {
+  syncCanvasSize();
+  drawOverlay();
+});
+
+function syncCanvasSize() {
+  const rect = frameImg.getBoundingClientRect();
+  overlay.width  = rect.width;
+  overlay.height = rect.height;
+  overlay.style.top    = frameImg.offsetTop  + 'px';
+  overlay.style.left   = frameImg.offsetLeft + 'px';
+  overlay.style.width  = rect.width  + 'px';
+  overlay.style.height = rect.height + 'px';
+}
+
+new ResizeObserver(() => { syncCanvasSize(); drawOverlay(); }).observe(frameImg);
+
+// ── Coordinate mapping ────────────────────────────────────────────────────────
+function origToCanvas(cx, cy) {
+  const rect = frameImg.getBoundingClientRect();
+  return [cx * rect.width / frameOrigW, cy * rect.height / frameOrigH];
+}
+function canvasToOrig(cx, cy) {
+  const rect = frameImg.getBoundingClientRect();
+  return [cx * frameOrigW / rect.width, cy * frameOrigH / rect.height];
+}
+
+// ── Overlay drawing ───────────────────────────────────────────────────────────
+function drawOverlay() {
+  ctx.clearRect(0, 0, overlay.width, overlay.height);
+  if (!currentVideoId) return;
+
+  // Draw saved ball for current frame
+  const saved = ballAnnotations.find(a => a.frame_idx === currentFrame);
+  if (saved && saved.visibility === 1) {
+    const [dx, dy] = origToCanvas(saved.cx, saved.cy);
+    ctx.beginPath();
+    ctx.arc(dx, dy, 10, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(0,255,136,0.3)';
+    ctx.fill();
+    ctx.strokeStyle = '#00ff88';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+
+  // Draw pending detection (TrackNet or YOLO)
+  if (pendingDetection && mode === 'ball') {
+    const [cx, cy] = origToCanvas(pendingDetection.cx, pendingDetection.cy);
+    const color = pendingDetection.source === 'tracknet' ? '#00d2ff' : '#ffd700';
+    // Draw bbox only for YOLO (has x0/y0/x1/y1)
+    if (pendingDetection.x0 != null) {
+      const [x0, y0] = origToCanvas(pendingDetection.x0, pendingDetection.y0);
+      const [x1, y1] = origToCanvas(pendingDetection.x1, pendingDetection.y1);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.setLineDash([5, 3]);
+      ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
+      ctx.setLineDash([]);
+    }
+    ctx.beginPath();
+    ctx.arc(cx, cy, 10, 0, Math.PI * 2);
+    ctx.fillStyle = pendingDetection.source === 'tracknet' ? 'rgba(0,210,255,0.2)' : 'rgba(255,215,0,0.25)';
+    ctx.fill();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    const src = pendingDetection.source.toUpperCase();
+    ctx.fillStyle = color;
+    ctx.font = '12px monospace';
+    ctx.fillText(`${src} ${(pendingDetection.conf * 100).toFixed(0)}%  Space=accept  Esc=skip`, cx - 30, cy - 16);
+  }
+}
+
+// ── YOLO auto-detection ───────────────────────────────────────────────────────
+async function runDetection(frame_idx) {
+  if (!currentVideoId) return;
+  setDetectStatus('pending', 'Detecting…');
+  const data = await fetch(`/api/videos/${enc(currentVideoId)}/frame/${frame_idx}/detect_ball`).then(r => r.json());
+  if (frame_idx !== currentFrame) return; // navigated away
+
+  if (data.found) {
+    const existing = ballAnnotations.find(a => a.frame_idx === currentFrame);
+    if (!existing) {
+      pendingDetection = data;
+      const src = (data.source || 'model').toUpperCase();
+      setDetectStatus('found', `${src}: conf ${(data.conf * 100).toFixed(0)}%`);
+    } else {
+      setDetectStatus('found', `saved (${existing.source})`);
+    }
+  } else {
+    const existing = ballAnnotations.find(a => a.frame_idx === currentFrame);
+    setDetectStatus('not-found', existing ? `saved (${existing.source})` : 'not detected — click to place');
+  }
+  drawOverlay();
+}
+
+function setDetectStatus(state, text) {
+  const dot = detectStatus.querySelector('.dot');
+  dot.className = `dot ${state}`;
+  detectStatus.querySelector('span:last-child').textContent = text;
+}
+
+// ── Ball annotation actions ───────────────────────────────────────────────────
+async function saveBallAnnotation(cx, cy, visibility, source) {
+  if (!currentVideoId) return;
+  await fetch(`/api/videos/${enc(currentVideoId)}/ball`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ frame_idx: currentFrame, cx, cy, visibility, source }),
+  });
+  pendingDetection = null;
+  await loadBallAnnotations();
+  drawOverlay();
+  setDetectStatus('found', `saved (${source})`);
+}
+
+async function deleteBallAnnotation(frame_idx) {
+  await fetch(`/api/videos/${enc(currentVideoId)}/ball/${frame_idx}`, { method: 'DELETE' });
+  await loadBallAnnotations();
+  drawOverlay();
+}
+
+// Canvas click → manual placement
+overlay.addEventListener('click', (e) => {
+  if (mode !== 'ball' || !currentVideoId) return;
+  const rect = overlay.getBoundingClientRect();
+  const [origX, origY] = canvasToOrig(e.clientX - rect.left, e.clientY - rect.top);
+  saveBallAnnotation(origX, origY, 1, 'manual');
+});
+
+// ── Event annotations ─────────────────────────────────────────────────────────
+async function loadEventAnnotations() {
+  if (!currentVideoId) return;
+  eventAnnotations = await fetch(`/api/videos/${enc(currentVideoId)}/annotations`).then(r => r.json());
+  renderEventAnnotations();
+  updateTimelines();
+}
+
+function renderEventAnnotations() {
+  annotationList.innerHTML = '';
+  eventAnnotations.forEach(a => {
+    const item = document.createElement('div');
+    item.className = 'annotation-item';
+    item.innerHTML = `<span>Frame <strong>${a.frame_idx}</strong></span>
+      <span class="label ${a.label}">${a.label.toUpperCase()}</span>
+      <button class="delete-btn">&times;</button>`;
+    item.addEventListener('click', e => { if (!e.target.classList.contains('delete-btn')) showFrame(a.frame_idx); });
+    item.querySelector('.delete-btn').addEventListener('click', async () => {
+      await fetch(`/api/videos/${enc(currentVideoId)}/annotations/${a.frame_idx}`, { method: 'DELETE' });
+      await loadEventAnnotations();
+    });
+    annotationList.appendChild(item);
+  });
+  const c = { net: 0, bounce: 0, hit: 0 };
+  eventAnnotations.forEach(a => c[a.label]++);
+  statsEvents.textContent = `Total: ${eventAnnotations.length} | Net:${c.net} Bounce:${c.bounce} Hit:${c.hit}`;
+}
+
+async function addEventAnnotation(label) {
+  if (!currentVideoId) return;
+  await fetch(`/api/videos/${enc(currentVideoId)}/annotations`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ frame_idx: currentFrame, label }),
+  });
+  await loadEventAnnotations();
+}
+
+// ── Ball annotations list ─────────────────────────────────────────────────────
+async function loadBallAnnotations() {
+  if (!currentVideoId) return;
+  ballAnnotations = await fetch(`/api/videos/${enc(currentVideoId)}/ball`).then(r => r.json());
+  renderBallAnnotations();
+  updateTimelines();
+}
+
+function renderBallAnnotations() {
+  ballList.innerHTML = '';
+  ballAnnotations.forEach(a => {
+    const item = document.createElement('div');
+    item.className = 'annotation-item';
+    const labelText = a.visibility ? 'BALL' : 'HIDDEN';
+    const labelClass = a.visibility ? 'ball' : 'hidden';
+    item.innerHTML = `<span>Frame <strong>${a.frame_idx}</strong></span>
+      <span class="label ${labelClass}">${labelText}</span>
+      <span class="src-badge">${a.source}</span>
+      <button class="delete-btn">&times;</button>`;
+    item.addEventListener('click', e => { if (!e.target.classList.contains('delete-btn')) showFrame(a.frame_idx); });
+    item.querySelector('.delete-btn').addEventListener('click', async () => {
+      await deleteBallAnnotation(a.frame_idx);
+    });
+    ballList.appendChild(item);
+  });
+  const visible = ballAnnotations.filter(a => a.visibility).length;
+  const hidden  = ballAnnotations.length - visible;
+  statsBall.textContent = `Total: ${ballAnnotations.length} | Visible: ${visible} | Hidden: ${hidden}`;
+}
+
+// ── Timelines ─────────────────────────────────────────────────────────────────
+function updateTimelines() {
+  [timelineE, timelineB].forEach(t => t.querySelectorAll('.marker,.current').forEach(el => el.remove()));
+  if (!totalFrames) return;
+
+  eventAnnotations.forEach(a => {
+    const m = document.createElement('div');
+    m.className = `marker ${a.label}`;
+    m.style.left = pct(a.frame_idx);
+    m.title = `${a.label} @ ${a.frame_idx}`;
+    timelineE.appendChild(m);
+  });
+
+  ballAnnotations.forEach(a => {
+    const m = document.createElement('div');
+    m.className = a.visibility ? 'marker ball' : 'marker ball-hidden';
+    m.style.left = pct(a.frame_idx);
+    m.title = `ball @ ${a.frame_idx}`;
+    timelineB.appendChild(m);
+  });
+
+  [timelineE, timelineB].forEach(t => {
+    const c = document.createElement('div');
+    c.className = 'current';
+    c.style.left = pct(currentFrame);
+    t.appendChild(c);
+  });
+}
+
+function pct(idx) { return `${(idx / (totalFrames - 1)) * 100}%`; }
+
+[timelineE, timelineB].forEach(tl => {
+  tl.addEventListener('click', e => {
+    if (!totalFrames) return;
+    const ratio = (e.clientX - tl.getBoundingClientRect().left) / tl.offsetWidth;
+    showFrame(Math.round(ratio * (totalFrames - 1)));
+  });
+});
+
+// ── Navigation & keyboard ─────────────────────────────────────────────────────
+document.getElementById('prevBtn').addEventListener('click', () => showFrame(currentFrame - 1));
+document.getElementById('nextBtn').addEventListener('click', () => showFrame(currentFrame + 1));
+frameSlider.addEventListener('input', () => showFrame(parseInt(frameSlider.value)));
+
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'SELECT' || e.target.tagName === 'INPUT') return;
+
+  if (e.key === 'ArrowLeft')  { e.preventDefault(); showFrame(currentFrame - (e.shiftKey ? 10 : 1)); return; }
+  if (e.key === 'ArrowRight') { e.preventDefault(); showFrame(currentFrame + (e.shiftKey ? 10 : 1)); return; }
+
+  if (mode === 'event') {
+    if (e.key === 'n' || e.key === 'N') addEventAnnotation('net');
+    if (e.key === 'b' || e.key === 'B') addEventAnnotation('bounce');
+    if (e.key === 'h' || e.key === 'H') addEventAnnotation('hit');
+  }
+
+  if (mode === 'ball') {
+    if (e.key === ' ') {
+      e.preventDefault();
+      if (pendingDetection) saveBallAnnotation(pendingDetection.cx, pendingDetection.cy, 1, pendingDetection.source || 'tracknet');
+    }
+    if (e.key === 'v' || e.key === 'V') saveBallAnnotation(0, 0, 0, 'manual');
+    if (e.key === 'Escape') { pendingDetection = null; drawOverlay(); setDetectStatus('not-found', 'cleared — click to place'); }
+  }
+});
+
+// ── Auto-markup ───────────────────────────────────────────────────────────────
+const autoMarkupBtn      = document.getElementById('autoMarkupBtn');
+const autoMarkupProgress = document.getElementById('autoMarkupProgress');
+const autoMarkupText     = document.getElementById('autoMarkupText');
+
+autoMarkupBtn.addEventListener('click', async () => {
+  if (!currentVideoId) return;
+  autoMarkupBtn.disabled = true;
+  autoMarkupProgress.style.display = 'block';
+  autoMarkupText.textContent = 'Running TrackNet on all frames…';
+
+  try {
+    const res = await fetch(`/api/videos/${enc(currentVideoId)}/detect_all`, { method: 'POST' });
+    const data = await res.json();
+    autoMarkupText.textContent = `Done: ${data.detected} / ${data.total} frames detected`;
+    await loadBallAnnotations();
+  } catch (err) {
+    autoMarkupText.textContent = `Error: ${err.message}`;
+  } finally {
+    autoMarkupBtn.disabled = false;
+    document.getElementById('autoMarkupBar').style.animation = 'none';
+    document.getElementById('autoMarkupBar').style.width = '100%';
+  }
+});
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function enc(s) { return encodeURIComponent(s); }
+
+loadVideos();
+</script>
+</body>
+</html>

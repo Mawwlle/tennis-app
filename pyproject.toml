@@ -1,0 +1,23 @@
+[project]
+name = "tennis-app"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "opencv-python>=4.9",
+    "pydantic>=2.0",
+    "numpy>=1.26",
+    "torch>=2.2",
+    "torchvision>=0.17",
+    "fastapi>=0.115",
+    "uvicorn>=0.34",
+    "ultralytics>=8.4.21",
+    "tqdm>=4.67.3",
+    "scipy>=1.13",
+]
+
+[project.scripts]
+train = "train_tracknet:entrypoint"
+infer = "infer_on_video:main"
+webapp = "main:main"

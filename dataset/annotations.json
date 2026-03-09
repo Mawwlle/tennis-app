@@ -1,0 +1,536 @@
+{
+  "videos": {
+    "normal_point/1.mov": [
+      {
+        "frame_idx": 78,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 84,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 110,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 125,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 175,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 204,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 257,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 289,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 313,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 343,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 373,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 426,
+        "label": "bounce"
+      }
+    ],
+    "normal_point/Screen Recording 2026-02-23 at 15.54.08.mov": [
+      {
+        "frame_idx": 55,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 76,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 106,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 127,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 166,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 189,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 225,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 279,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 307,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 344,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 378,
+        "label": "bounce"
+      }
+    ],
+    "normal_point/Screen Recording 2026-02-23 at 16.02.35.mov": [
+      {
+        "frame_idx": 4,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 16,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 55,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 71,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 111,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 124,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 145,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 163,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 195,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 208,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 237,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 255,
+        "label": "hit"
+      }
+    ],
+    "normal_point/Screen Recording 2026-02-23 at 16.04.02.mov": [
+      {
+        "frame_idx": 32,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 40,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 68,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 84,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 135,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 160,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 183,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 207,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 276,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 308,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 326,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 354,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 388,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 406,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 435,
+        "label": "bounce"
+      }
+    ],
+    "normal_point/Screen Recording 2026-02-23 at 16.09.06.mov": [
+      {
+        "frame_idx": 37,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 48,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 72,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 86,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 117,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 132,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 164,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 178,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 205,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 259,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 281,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 296,
+        "label": "net"
+      }
+    ],
+    "sasha_tichka/Screen Recording 2026-02-23 at 16.18.27.mov": [
+      {
+        "frame_idx": 40,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 68,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 85,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 104,
+        "label": "bounce"
+      }
+    ],
+    "serve_into_net/Screen Recording 2026-02-22 at 17.59.09.mov": [
+      {
+        "frame_idx": 7,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 45,
+        "label": "net"
+      },
+      {
+        "frame_idx": 82,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 103,
+        "label": "bounce"
+      }
+    ],
+    "serve_into_net/Screen Recording 2026-02-22 at 18.16.14.mov": [
+      {
+        "frame_idx": 64,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 78,
+        "label": "net"
+      },
+      {
+        "frame_idx": 101,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 115,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 131,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 142,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 152,
+        "label": "bounce"
+      }
+    ],
+    "serve_into_net/Screen Recording 2026-02-22 at 18.18.20.mov": [
+      {
+        "frame_idx": 38,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 51,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 80,
+        "label": "net"
+      },
+      {
+        "frame_idx": 103,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 124,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 146,
+        "label": "bounce"
+      }
+    ],
+    "soplya_setka/1.mov": [
+      {
+        "frame_idx": 80,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 82,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 107,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 126,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 161,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 181,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 199,
+        "label": "net"
+      },
+      {
+        "frame_idx": 215,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 233,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 267,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 289,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 310,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 327,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 352,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 365,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 397,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 404,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 429,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 444,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 454,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 477,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 495,
+        "label": "hit"
+      }
+    ],
+    "soplya_setka/Screen Recording 2026-02-23 at 16.06.27.mov": [
+      {
+        "frame_idx": 31,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 43,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 70,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 83,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 105,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 119,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 150,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 165,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 178,
+        "label": "net"
+      },
+      {
+        "frame_idx": 196,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 217,
+        "label": "bounce"
+      }
+    ],
+    "soplya_setka/Screen Recording 2026-02-23 at 16.23.03.mov": [
+      {
+        "frame_idx": 122,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 127,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 156,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 166,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 189,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 206,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 238,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 250,
+        "label": "hit"
+      },
+      {
+        "frame_idx": 269,
+        "label": "net"
+      },
+      {
+        "frame_idx": 285,
+        "label": "bounce"
+      },
+      {
+        "frame_idx": 305,
+        "label": "bounce"
+      }
+    ]
+  }
+}
