@@ -19,7 +19,7 @@ TARGET_W       = 640
 TARGET_H       = 360
 CONF_THRESHOLD = 0.98
 TRAIL_WINDOW   = 9
-INFER_STEP     = 2   # run TrackNet every N frames; gaps filled by interpolation
+INFER_STEP     = 3   # run TrackNet every N frames; gaps filled by interpolation
 
 
 def load_model(weights: Path, device: torch.device) -> TrackNet:
