@@ -11,15 +11,15 @@ from tqdm import tqdm
 
 from tracknet.model import TrackNet
 
-VIDEO_PATH = Path("dataset/videos/normal_point/Screen Recording 2026-02-23 at 15.54.08.mov")
+VIDEO_PATH = Path("dataset/videos/sasha_tichka/Screen Recording 2026-02-23 at 16.18.27.mov")
 WEIGHTS    = Path("weights/tracknet_best.pt")
 OUTPUT     = Path("infer_result_new.mp4")
 
 TARGET_W       = 640
 TARGET_H       = 360
-CONF_THRESHOLD = 0.99
+CONF_THRESHOLD = 0.98
 TRAIL_WINDOW   = 9
-INFER_STEP     = 4   # run TrackNet every N frames; gaps filled by interpolation
+INFER_STEP     = 2   # run TrackNet every N frames; gaps filled by interpolation
 
 
 def load_model(weights: Path, device: torch.device) -> TrackNet:
