@@ -70,6 +70,9 @@
 
   .stats { padding: 10px 14px; border-top: 1px solid #0f3460; font-size: 11px; color: #777; }
 
+  .model-toggle { padding: 7px 14px; border-bottom: 1px solid #0f3460; display: flex; align-items: center; gap: 8px; font-size: 12px; color: #aaa; cursor: pointer; user-select: none; }
+  .model-toggle input { accent-color: #533483; cursor: pointer; }
+  .model-toggle.off { color: #555; }
   .detect-status { padding: 8px 14px; font-size: 12px; border-bottom: 1px solid #0f3460; min-height: 34px; display: flex; align-items: center; gap: 8px; }
   .detect-status .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
   .detect-status .dot.found { background: #00ff88; }
@@ -148,6 +151,10 @@
 
     <!-- Ball tab -->
     <div class="tab-content" id="panelBall">
+      <label class="model-toggle" id="modelToggleLabel">
+        <input type="checkbox" id="modelToggle" checked>
+        Model-assisted detection
+      </label>
       <div class="detect-status" id="detectStatus">
         <span class="dot not-found"></span><span>—</span>
       </div>
@@ -266,7 +273,11 @@ function showFrame(idx) {
   updateTimelines();
   drawOverlay();
 
-  if (mode === 'ball') runDetection(currentFrame);
+  if (mode === 'ball' && document.getElementById('modelToggle').checked) runDetection(currentFrame);
+  else if (mode === 'ball') {
+    const existing = ballAnnotations.find(a => a.frame_idx === currentFrame);
+    setDetectStatus('not-found', existing ? `saved (${existing.source})` : 'model off — click to place');
+  }
 }
 
 frameImg.addEventListener('load', () => {
@@ -529,6 +540,19 @@ document.addEventListener('keydown', e => {
     }
     if (e.key === 'v' || e.key === 'V') saveBallAnnotation(0, 0, 0, 'manual');
     if (e.key === 'Escape') { pendingDetection = null; drawOverlay(); setDetectStatus('not-found', 'cleared — click to place'); }
+  }
+});
+
+// ── Model toggle ─────────────────────────────────────────────────────────────
+document.getElementById('modelToggle').addEventListener('change', (e) => {
+  document.getElementById('modelToggleLabel').classList.toggle('off', !e.target.checked);
+  if (!e.target.checked) {
+    pendingDetection = null;
+    drawOverlay();
+    const existing = ballAnnotations.find(a => a.frame_idx === currentFrame);
+    setDetectStatus('not-found', existing ? `saved (${existing.source})` : 'model off — click to place');
+  } else if (currentVideoId && mode === 'ball') {
+    runDetection(currentFrame);
   }
 });
 

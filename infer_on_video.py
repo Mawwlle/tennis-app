@@ -11,14 +11,15 @@ from tqdm import tqdm
 
 from tracknet.model import TrackNet
 
-VIDEO_PATH = Path("dataset/videos/normal_point/1.mov")
+VIDEO_PATH = Path("dataset/videos/normal_point/Screen Recording 2026-02-23 at 15.54.08.mov")
 WEIGHTS    = Path("weights/tracknet_best.pt")
-OUTPUT     = Path("infer_result.mp4")
+OUTPUT     = Path("infer_result_new.mp4")
 
 TARGET_W       = 640
 TARGET_H       = 360
 CONF_THRESHOLD = 0.4
 TRAIL_WINDOW   = 9
+INFER_STEP     = 3   # run TrackNet every N frames; gaps filled by interpolation
 
 
 def load_model(weights: Path, device: torch.device) -> TrackNet:
@@ -149,9 +150,10 @@ def run(weights: Path, video_path: Path, output: Path) -> None:
         while len(frame_buffer) < 3:
             frame_buffer.insert(0, frame_buffer[0])
 
-        cx, cy, _, _ = predict(model, frame_buffer[-3:], device)
-        if cx >= 0:
-            detections[frame_idx] = (cx, cy)
+        if frame_idx % INFER_STEP == 0:
+            cx, cy, _, _ = predict(model, frame_buffer[-3:], device)
+            if cx >= 0:
+                detections[frame_idx] = (cx, cy)
     cap.release()
 
     print(f"  detected {len(detections)}/{total} frames")
@@ -169,6 +171,7 @@ def run(weights: Path, video_path: Path, output: Path) -> None:
 
     frame_buffer = []
     known_frames = sorted(detections)
+    heatmap = np.zeros((TARGET_H, TARGET_W), dtype=np.float32)
 
     cap = cv2.VideoCapture(str(video_path))
     for frame_idx in tqdm(range(total), desc="Rendering", unit="frame"):
@@ -183,7 +186,9 @@ def run(weights: Path, video_path: Path, output: Path) -> None:
         while len(frame_buffer) < 3:
             frame_buffer.insert(0, frame_buffer[0])
 
-        _, _, _, heatmap = predict(model, frame_buffer[-3:], device)
+        if frame_idx % INFER_STEP == 0:
+            _, _, _, heatmap = predict(model, frame_buffer[-3:], device)
+        # else: reuse previous heatmap
 
         # Left: tracking on resized frame
         left = cv2.resize(raw, (TARGET_W, TARGET_H))
