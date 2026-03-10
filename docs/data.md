@@ -9,11 +9,17 @@ dataset/
   videos/
     normal_point/          — видео: обычный розыгрыш
     serve_into_net/        — видео: подача в сетку
-    sasha_tichka/          — видео: ...
-    soplya_setka/          — видео: ...
+    sasha_tichka/
+    soplya_setka/
+  frames/                  — предизвлечённые JPEG-кадры для обучения
+    normal_point/
+      video_name/
+        000078.jpg         — кадр с номером 78
+        ...
 
 weights/
   tracknet_best.pt         — обученный TrackNet
+  tracknet_opt.onnx        — ONNX после упрощения
   yolo_det.pt              — YOLO-детектор
 ```
 
@@ -41,10 +47,9 @@ weights/
         "cx": 524.41,
         "cy": 851.39,
         "visibility": 1,
-        "source": "yolo"
+        "source": "tracknet"
       }
-    ],
-    "serve_into_net/Untitled.mov": [...]
+    ]
   }
 }
 ```
@@ -57,29 +62,22 @@ weights/
 | `cx` | float | Центр мяча по X в **оригинальных пикселях** видео |
 | `cy` | float | Центр мяча по Y в **оригинальных пикселях** видео |
 | `visibility` | int | `1` — мяч виден, `0` — мяча нет в кадре |
-| `source` | string | `"manual"` — вручную, `"yolo"` — принята детекция YOLO |
+| `source` | string | `"manual"`, `"yolo"` или `"tracknet"` |
 
 ### Важно про координаты
 
-Координаты хранятся в пикселях **оригинального разрешения видео** (2914×1552). При обучении они масштабируются:
+Координаты хранятся в пикселях **оригинального разрешения видео**. При обучении они масштабируются:
 
+```python
+cx_for_training = cx * 640 / orig_w
+cy_for_training = cy * 360 / orig_h
 ```
-cx_for_training = cx * 640 / 2914
-cy_for_training = cy * 360 / 1552
-```
-
-Текущее состояние:
-- **725 аннотаций** по 3 видео
-- Все `visibility=1` (мяч всегда виден)
-- 418 аннотаций в `normal_point/1.mov` (кадры 78–517)
-- 157 аннотаций в `serve_into_net/Screen Recording...` (кадры 0–206)
-- 150 аннотаций в `serve_into_net/Untitled.mov` (кадры 8–176)
 
 ---
 
 ## `annotations.json`
 
-Для будущего 3D CNN классификатора игровых событий. Пока мало заполнен.
+Для 3D CNN классификатора игровых событий.
 
 ### Структура
 
@@ -104,48 +102,7 @@ cy_for_training = cy * 360 / 1552
 
 ---
 
-## `tennis-dataset/` — внешний датасет
-
-Разметка стола, сетки и ракеток. **Мяча нет.**
-
-### Формат меток (YOLO segmentation)
-
-Каждый `.txt` файл соответствует одному PNG-кадру. Формат строки:
-
-```
-class_id  x1 y1  x2 y2  x3 y3  ...  xn yn
-```
-
-Все координаты нормализованы к `[0, 1]` относительно размера изображения.
-
-Пример файла `frame_000498.txt`:
-```
-2 0.096 0.998 0.095 0.913 0.387 0.635 0.389 0.677
-1 0.001 0.781 0.161 0.693 0.625 0.706 0.686 1.000 0.374 0.998 0.004 0.948
-```
-
-### Классы
-
-| ID | Класс |
-|---|---|
-| `0` | ball (мяч) — **в этом датасете отсутствует** |
-| `1` | table (стол) |
-| `2` | grid (сетка) |
-| `3` | racket (ракетка) |
-
-### Конвертация в пиксели
-
-Изображения 1280×720, поэтому:
-```python
-x_pixel = x_normalized * 1280
-y_pixel = y_normalized * 720
-```
-
----
-
 ## Pydantic схемы (`model/schemas.py`)
-
-Pydantic — библиотека для валидации данных. Все структуры данных описаны как Pydantic-модели: при создании объекта автоматически проверяются типы.
 
 ### Схемы аннотаций
 
@@ -157,24 +114,24 @@ class GameState(StrEnum):
 
 class Annotation(BaseModel):
     frame_idx: int
-    label: GameState         # только "net", "bounce" или "hit"
+    label: GameState
 
 class AnnotationStore(BaseModel):
     videos: dict[str, list[Annotation]] = {}
-    # ключ = video_id, значение = список аннотаций
 ```
 
 ```python
 class BallSource(StrEnum):
     yolo = "yolo"
     manual = "manual"
+    tracknet = "tracknet"
 
 class BallAnnotation(BaseModel):
     frame_idx: int
     cx: float
     cy: float
     visibility: int          # 0 или 1
-    source: BallSource       # только "yolo" или "manual"
+    source: BallSource
 
 class BallAnnotationStore(BaseModel):
     videos: dict[str, list[BallAnnotation]] = {}
@@ -209,20 +166,21 @@ train_tracknet.py: load_samples()
     │  Для каждой записи создаёт Sample:
     │  {video_path, frame_idx, cx, cy, orig_w, orig_h, visibility}
     ▼
+tracknet/dataset.py: prepare_frames()
+    │  Предизвлекает кадры [t-2, t-1, t] из видео в dataset/frames/
+    │  Пропускает уже существующие файлы
+    ▼
 tracknet/dataset.py: TrackNetDataset.__getitem__()
-    │  Для кадра t:
-    │  1. Читает кадры t-2, t-1, t из видеофайла
-    │  2. Ресайзит каждый до 640×360
-    │  3. Нормализует к [0,1]
-    │  4. Стэкает в тензор (9, 360, 640)
-    │  5. Масштабирует cx, cy
-    │  6. Генерирует тепловую карту (1, 360, 640)
+    │  Читает кадры t-2, t-1, t через cv2.imread из JPEG
+    │  Стэкает в тензор (9, 360, 640)
+    │  Масштабирует cx, cy
+    │  Генерирует тепловую карту (1, 360, 640)
     ▼
 train_loader / val_loader
-    │  batch_size=4, 579 train / 146 val
+    │  batch_size=4, num_workers=4, pin_memory=True
     ▼
 tracknet/train.py: train_epoch()
-    │  forward → loss → backward → optimizer.step()
+    │  forward → focal_bce_loss → backward → optimizer.step()
     ▼
-tracknet_weights/tracknet_best.pt
+weights/tracknet_best.pt
 ```

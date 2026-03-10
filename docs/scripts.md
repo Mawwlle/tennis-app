@@ -12,7 +12,7 @@ uv run webapp   # запустить веб-аннотатор
 
 ## `train_tracknet.py` — обучение TrackNet
 
-Читает аннотации, создаёт даталоадеры, запускает цикл обучения.
+Читает аннотации, предизвлекает кадры, создаёт даталоадеры, запускает цикл обучения.
 
 ### Запуск
 
@@ -34,6 +34,10 @@ LR         = 1.0    # learning rate для Adadelta
 VAL_RATIO  = 0.2    # 20% данных — валидация
 ```
 
+### Предизвлечение кадров
+
+При первом запуске автоматически запускается `prepare_frames()` — все нужные кадры `[t-2, t-1, t]` сохраняются в `dataset/frames/` как JPEG 640×360. При повторных запусках пропускаются уже извлечённые файлы.
+
 ### Что сохраняется
 
 ```
@@ -46,49 +50,46 @@ weights/
 
 Автоматически: MPS (Apple Silicon) → CUDA (Nvidia) → CPU.
 
-### Фильтрация данных
-
-При загрузке датасета вызывается `is_sample_readable()` — каждый семпл проверяется на читаемость из видеофайла. Нечитаемые кадры отбрасываются с предупреждением.
-
 ---
 
 ## `infer_on_video.py` — применить TrackNet к видео
 
-Запускает TrackNet на каждом кадре и сохраняет видео с двумя панелями: слева — трекинг с траекторией, справа — тепловая карта.
+Запускает TrackNet и сохраняет видео с двумя панелями: слева — трекинг с траекторией, справа — тепловая карта.
 
 ### Запуск
 
 ```bash
 uv run infer
 # или: uv run python infer_on_video.py
-# Результат: infer_result.mp4
+# Результат: infer_result_new.mp4
 ```
 
 ### Параметры
 
 ```python
-VIDEO_PATH = Path("dataset/videos/normal_point/1.mov")
-WEIGHTS    = Path("weights/tracknet_best.pt")
-OUTPUT     = Path("infer_result.mp4")
+VIDEO_PATH     = Path("dataset/videos/normal_point/...")
+WEIGHTS        = Path("weights/tracknet_best.pt")
+OUTPUT         = Path("infer_result_new.mp4")
 
 CONF_THRESHOLD = 0.4   # минимальная уверенность для детекции
 TRAIL_WINDOW   = 9     # последние N детекций для трейла
+INFER_STEP     = 3     # запускать TrackNet каждые N кадров
 ```
 
 ### Как работает
 
 **Pass 1 (детекция):**
 
-Проходит по видео один раз, запускает TrackNet с буфером из 3 кадров:
+Проходит по видео один раз. TrackNet запускается каждые `INFER_STEP=3` кадра:
 
 ```python
-# Для каждого кадра t:
-frames = [t-2, t-1, t]          # скользящее окно
-heatmap = tracknet(frames)       # (1, 360, 640) тепловая карта
-cx, cy = argmax(heatmap)         # позиция мяча
+if frame_idx % INFER_STEP == 0:
+    cx, cy, conf, _ = predict(model, frames[-3:], device)
+    if cx >= 0:
+        detections[frame_idx] = (cx, cy)
 ```
 
-Между кадрами где мяч найден — позиции заполняются сплайном:
+Между кадрами где мяч найден — позиции заполняются сплайн-интерполяцией:
 
 ```python
 spl_x = make_interp_spline(detected_frames, xs, k=3)
@@ -107,6 +108,35 @@ spl_y = make_interp_spline(detected_frames, ys, k=3)
 | Синий кружок — интерполирован | — |
 
 Итоговый размер видео: **1280×360**.
+
+---
+
+## `export_onnx.py` — экспорт в ONNX
+
+Экспортирует обученный TrackNet в ONNX, упрощает граф через `onnxsim`, бенчмаркирует производительность.
+
+### Запуск
+
+```bash
+uv run python export_onnx.py
+```
+
+### Что создаётся
+
+```
+weights/
+  tracknet.onnx      — сырой ONNX (opset 18)
+  tracknet_opt.onnx  — упрощённый через onnxsim
+```
+
+### Производительность (CPU, Apple M-series)
+
+| Формат | Время/кадр |
+|---|---|
+| PyTorch (.pt) | ~40 ms |
+| ONNX opt | ~52 ms |
+
+Подробнее — в `weights/README.md`.
 
 ---
 

@@ -2,7 +2,7 @@
 
 ## Что такое TrackNet
 
-TrackNet — это нейросеть специально для отслеживания маленьких быстрых мячей в видео (бадминтон, настольный теннис, теннис). Оригинальная работа: [github.com/yastrebksv/TrackNet](https://github.com/yastrebksv/TrackNet).
+Нейросеть для отслеживания маленьких быстрых мячей в видео. Собственная реализация UNet с depthwise separable свёртками.
 
 Ключевая идея: **вместо bbox предсказывать тепловую карту**.
 
@@ -12,8 +12,8 @@ TrackNet — это нейросеть специально для отслеж�
 
 TrackNet:
   3 кадра → [нейросеть] → тепловая карта (числа 0..1 в каждом пикселе)
-                             ↓
-                         найти максимум → координата мяча
+                           ↓
+                       найти максимум → координата мяча
 ```
 
 ---
@@ -82,7 +82,7 @@ TrackNet видит не один кадр, а **три последовател
 
 ### Масштаб кадров
 
-Видео имеет разрешение 2914×1552, но TrackNet обучается на 640×360:
+Видео имеет исходное разрешение (например, 2914×1552), но TrackNet обучается на 640×360:
 
 ```python
 TARGET_W = 640
@@ -95,15 +95,15 @@ frame = frame.astype(np.float32) / 255.0  # нормализация к [0, 1]
 Координаты аннотаций тоже масштабируются:
 
 ```python
-cx_scaled = ann.cx * 640 / 2914   # ≈ ann.cx * 0.22
-cy_scaled = ann.cy * 360 / 1552   # ≈ ann.cy * 0.23
+cx_scaled = s.cx * 640 / s.orig_w
+cy_scaled = s.cy * 360 / s.orig_h
 ```
 
 ---
 
-## Архитектура модели (VGG-UNet)
+## Архитектура модели (UNet + Depthwise Separable)
 
-Модель состоит из двух частей: энкодера (сжимает) и декодера (разворачивает обратно).
+Модель — UNet с encoder-decoder и skip connections. Все свёртки — depthwise separable.
 
 ### Схема
 
@@ -112,67 +112,57 @@ cy_scaled = ann.cy * 360 / 1552   # ≈ ann.cy * 0.23
     │
     ▼
 ┌─────────────────────────────────┐ ЭНКОДЕР
-│ VGG-блок 1: 9 → 64 каналов     │
-│ MaxPool → 180×320               │
-│                                 │
-│ VGG-блок 2: 64 → 128 каналов   │
-│ MaxPool → 90×160                │
-│                                 │
-│ VGG-блок 3: 128 → 256 каналов  │
-│ MaxPool → 45×80                 │
-│                                 │
-│ Bottleneck: 256 → 512 каналов  │ ← самое "сжатое" представление
+│ enc1:  9 → 16 каналов           │  (B, 16, 360, 640)
+│ pool + enc2: 16 → 32            │  (B, 32, 180, 320)
+│ pool + enc3: 32 → 64            │  (B, 64, 90, 160)
+│ pool + bottleneck: 64 → 128     │  (B, 128, 45, 80)
 └─────────────────────────────────┘
     │
     ▼
-┌─────────────────────────────────┐ ДЕКОДЕР
-│ Upsample ×2 → 90×160           │
-│ VGG-блок: 512 → 256 каналов    │
-│                                 │
-│ Upsample ×2 → 180×320          │
-│ VGG-блок: 256 → 128 каналов    │
-│                                 │
-│ Upsample ×2 → 360×640          │
-│ VGG-блок: 128 → 64 каналов     │
+┌─────────────────────────────────┐ ДЕКОДЕР (со skip connections)
+│ upsample + cat(e3) → dec3: 192→64  │  (B, 64, 90, 160)
+│ upsample + cat(e2) → dec2: 96→32   │  (B, 32, 180, 320)
+│ upsample + cat(e1) → dec1: 48→16   │  (B, 16, 360, 640)
 └─────────────────────────────────┘
     │
     ▼
-Conv 1×1: 64 → 1 канал
+head Conv 1×1: 16 → 1
     │
     ▼
-Выход: (B, 1, 360, 640) — тепловая карта (logits)
+Выход: (B, 1, 360, 640) — logits тепловой карты
 ```
 
-### VGG-блок
+**Параметры: 63K** (вместо 15M у оригинального TrackNet).
+
+### Depthwise Separable свёртки
+
+Обычная Conv2d делает две вещи сразу: ищет паттерны **в пространстве** и смешивает каналы. Здесь разбиваем на два шага:
+
+1. **Depthwise** — 3×3 свёртка отдельно по каждому каналу (`groups=in_ch`)
+2. **Pointwise** — 1×1 свёртка для смешивания каналов
 
 ```python
-def _vgg_block(in_ch, out_ch, n):
-    # n раз: Conv2D → ReLU → BatchNorm
-    layers = []
-    for i in range(n):
-        ch_in = in_ch if i == 0 else out_ch
-        layers += [Conv2d(ch_in, out_ch, 3, padding=1), ReLU(), BatchNorm2d(out_ch)]
-    return Sequential(*layers)
+def _dw_block(in_ch, out_ch) -> nn.Sequential:
+    return nn.Sequential(
+        nn.Conv2d(in_ch, in_ch, 3, padding=1, groups=in_ch, bias=False),  # spatial
+        nn.Conv2d(in_ch, out_ch, 1, bias=False),                           # channel mix
+        nn.BatchNorm2d(out_ch),
+        nn.ReLU(inplace=True),
+    )
 ```
 
-**Conv2D** — свёрточный слой, извлекает паттерны
-**ReLU** — активация, обнуляет отрицательные значения
-**BatchNorm** — нормализует значения, стабилизирует обучение
+Даёт ~8× меньше параметров при схожем качестве.
 
-### Downsampling и Upsampling
+### Skip connections
 
-**MaxPool2d(2)** — сжимает карту признаков в 2 раза, берёт максимум из блока 2×2 пикселей.
+Encoder на каждом уровне сохраняет карты признаков `e1, e2, e3`. Decoder при апсемплинге склеивает их с текущей картой:
 
-**Bilinear interpolation** — растягивает карту признаков в 2 раза методом билинейной интерполяции:
 ```python
-nn.functional.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+x = self.dec3(torch.cat([x, e3], dim=1))  # знаем ЧТО + детали enc3
 ```
 
-Это стандартный способ восстановить пространственное разрешение в UNet-подобных архитектурах.
-
-### Почему нет skip connections
-
-В классическом UNet есть "мостики" (skip connections) между энкодером и декодером. TrackNet их не использует — это упрощает архитектуру и снижает риск переобучения на маленьком датасете.
+Это позволяет декодеру точно локализовать мяч в пикселях — энкодер передаёт пространственные детали с каждого уровня.
 
 ---
 
@@ -205,99 +195,55 @@ def focal_bce_loss(pred, target, gamma=2.0, pos_weight=50.0):
 ```python
 def _detection_metrics(pred_logits, target, threshold=0.5, dist_tol=5):
     for pred_map, gt_map in zip(preds, gts):
-        # Найти предсказанную позицию — пиксель с максимальным значением
         py, px = divmod(pred_map.argmax(), pred_map.shape[1])
-
-        # Найти реальную позицию
         gy, gx = divmod(gt_map.argmax(), gt_map.shape[1])
-
-        # Расстояние между ними
         dist = sqrt((px - gx)² + (py - gy)²)
-
         if dist <= 5:   # допуск 5 пикселей в пространстве 640×360
-            tp += 1     # правильно найден
+            tp += 1
         else:
-            fp += 1; fn += 1  # нашли, но не там
+            fp += 1; fn += 1
 ```
 
-**Precision** = TP / (TP + FP) — из всех предсказаний сколько правильных
-**Recall** = TP / (TP + FN) — из всех реальных мячей сколько нашли
-**F1** = 2 × P × R / (P + R) — среднее гармоническое, главная метрика
-
-5 пикселей допуска в 640×360 = примерно 15 пикселей в оригинале 2914×1552 ≈ 0.5% ширины кадра.
+**F1** = 2 × P × R / (P + R) — главная метрика. 5 пикселей допуска в 640×360 ≈ 0.5% ширины кадра.
 
 ---
 
 ## Обучение
 
-### `train_tracknet.py` — точка входа
-
-```python
-device = torch.device("mps" if mps_available else "cuda" if cuda_available else "cpu")
-# mps = Apple Silicon GPU, cuda = Nvidia GPU, cpu = процессор
-
-samples = load_samples("annotations/ball_annotations.json", "dataset/")
-train_loader, val_loader = build_loaders(samples, val_ratio=0.2, batch_size=4)
-run_training(train_loader, val_loader, epochs=100, lr=1.0, ...)
-```
-
 ### Разделение на train/val
 
-Важный момент: выборка делится не случайно, а **по временному порядку внутри каждого видео**.
+Выборка делится не случайно, а **по временному порядку внутри каждого видео**.
 
 ```
-normal_point/1.mov: 418 аннотаций
-  80% (334 кадра) → train: кадры с 78 по ~390
-  20% ( 84 кадра) → val:   кадры с ~391 по 517
+normal_point/1.mov:
+  80% → train: ранние кадры
+  20% → val:   поздние кадры
 ```
 
 Почему не случайно: соседние кадры очень похожи. Если перемешать, модель просто запомнит конкретные кадры вместо того чтобы научиться находить мяч.
+
+### Предизвлечение кадров
+
+Перед обучением `prepare_frames()` сохраняет все нужные кадры `[t-2, t-1, t]` в `dataset/frames/` как JPEG 640×360. Это решает проблему ненадёжного видеосикинга в DataLoader воркерах.
 
 ### Оптимизатор: Adadelta
 
 ```python
 optimizer = torch.optim.Adadelta(model.parameters(), lr=1.0)
-```
-
-Adadelta автоматически подстраивает learning rate для каждого параметра. lr=1.0 — стандартное значение для него (не значит что шаг огромный).
-
-### Scheduler: ReduceLROnPlateau
-
-```python
 scheduler = ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
 ```
 
-Если val_loss не улучшается 5 эпох подряд → уменьшить lr в 2 раза. Помогает доучиться после плато.
-
-### Процесс
-
-```
-Каждую эпоху:
-  for batch in train_loader:
-    1. Прочитать 4 тройки кадров (batch_size=4)
-    2. Прогнать через модель → получить 4 тепловые карты
-    3. Вычислить focal BCE loss
-    4. Backward → обновить веса
-
-Каждые 5 эпох:
-  Запустить на val_loader → вычислить F1
-  Если F1 лучший → сохранить модель в tracknet_best.pt
-  Если val_loss не улучшается 5 раз → уменьшить lr
-```
+Adadelta автоматически подстраивает learning rate. Если val_loss не улучшается 5 эпох → lr ÷ 2.
 
 ### Логи
 
-Все метрики пишутся в консоль и в файл `tracknet_weights/train.log`:
+Все метрики пишутся в консоль и в `weights/train.log`:
 
 ```
 10:32:15  Epoch   1/100  train=0.0234  val=0.0198  P=0.421  R=0.380  F1=0.400
 10:33:42  Epoch   5/100  train=0.0189  val=0.0176  P=0.512  R=0.498  F1=0.505
-10:33:42    ✓ new best F1=0.505  saved → tracknet_weights/tracknet_best.pt
+10:33:42    ✓ new best F1=0.505  saved → weights/tracknet_best.pt
 ```
-
-### Результат
-
-Лучшая модель сохраняется в `tracknet_weights/tracknet_best.pt`. Это файл с весами нейросети (~50 МБ).
 
 ---
 
@@ -312,8 +258,8 @@ class Sample:
     frame_idx: int     # индекс аннотированного кадра t
     cx: float          # координата мяча в оригинале
     cy: float
-    orig_w: int        # оригинальный размер (2914)
-    orig_h: int        # оригинальный размер (1552)
+    orig_w: int        # оригинальный размер видео
+    orig_h: int
     visibility: int    # 1 = виден
 ```
 
@@ -322,52 +268,46 @@ class Sample:
 ```python
 def __getitem__(self, idx):
     s = self.samples[idx]
-    cap = cv2.VideoCapture(str(s.video_path))
+    t = s.frame_idx
 
-    # Тройка кадров: t-2, t-1, t (с clamp: если t=0, то 0,0,0)
-    idxs = [max(0, s.frame_idx - 2), max(0, s.frame_idx - 1), s.frame_idx]
-    frames = [_read_frame(cap, i) for i in idxs]  # каждый: float32 (360, 640, 3)
+    # Тройка кадров из предизвлечённых JPEG-файлов
+    frames = [_load_frame(s.video_path, max(0, t - 2)),
+              _load_frame(s.video_path, max(0, t - 1)),
+              _load_frame(s.video_path, t)]
 
-    # Стэкнуть в 9 каналов: (3, H, W, 3) → transpose → (9, H, W)
-    stacked = np.concatenate([f.transpose(2,0,1) for f in frames], axis=0)
+    stacked = np.concatenate([f.transpose(2, 0, 1) for f in frames], axis=0)
 
-    # Сгенерировать тепловую карту
-    cx_s = s.cx * 640 / s.orig_w   # масштаб
-    cy_s = s.cy * 360 / s.orig_h
-    heatmap = make_heatmap(cx_s, cy_s, 640, 360)  # (360, 640)
+    cx_s = s.cx * TARGET_W / s.orig_w
+    cy_s = s.cy * TARGET_H / s.orig_h
+    heatmap = make_heatmap(cx_s, cy_s, TARGET_W, TARGET_H)
 
     return torch.from_numpy(stacked), torch.from_numpy(heatmap).unsqueeze(0)
     # shapes: (9, 360, 640)           (1, 360, 640)
 ```
 
-Каждый раз открывает видеофайл заново — медленно, зато не нужно держать в памяти все кадры.
+Кадры читаются через `cv2.imread` из JPEG-файлов — быстро и надёжно.
 
 ---
 
-## Инференс (как использовать обученную модель)
-
-После обучения модель применяется так:
+## Инференс
 
 ```python
 model = TrackNet()
-model.load_state_dict(torch.load("tracknet_weights/tracknet_best.pt"))
+model.load_state_dict(torch.load("weights/tracknet_best.pt", map_location=device))
 model.eval()
 
 # Подготовить три кадра
-frames = load_triplet(video, frame_idx)          # (9, 360, 640)
-input_tensor = frames.unsqueeze(0)               # (1, 9, 360, 640)
+stacked = np.concatenate([f.transpose(2, 0, 1) for f in frames], axis=0)
+tensor = torch.from_numpy(stacked).unsqueeze(0).to(device)  # (1, 9, 360, 640)
 
 with torch.no_grad():
-    logits = model(input_tensor)                 # (1, 1, 360, 640)
-    heatmap = torch.sigmoid(logits)[0, 0]        # (360, 640), значения [0,1]
+    logits = model(tensor)                   # (1, 1, 360, 640)
+    heatmap = torch.sigmoid(logits)[0, 0]   # (360, 640), значения [0,1]
 
-# Найти позицию мяча
-if heatmap.max() > 0.5:
-    pos = heatmap.argmax()
-    y, x = divmod(pos.item(), 640)
+if heatmap.max() > 0.4:
+    flat = heatmap.argmax().item()
+    cy, cx = divmod(flat, 640)
     # Масштабировать обратно к оригинальным координатам
-    cx = x * orig_w / 640
-    cy = y * orig_h / 360
+    cx_orig = cx * orig_w / 640
+    cy_orig = cy * orig_h / 360
 ```
-
-Это логика, которую нужно реализовать в `apply_to_frame.py` после того как TrackNet обучен.
