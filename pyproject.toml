@@ -3,12 +3,11 @@ name = "tennis-app"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "opencv-python>=4.9",
     "pydantic>=2.0",
     "numpy>=1.26",
-    "torch>=2.2",
     "torchvision>=0.17",
     "fastapi>=0.115",
     "uvicorn>=0.34",
@@ -20,9 +19,11 @@ dependencies = [
     "onnxruntime>=1.24.3",
     "onnxscript>=0.6.2",
     "matplotlib>=3.10.8",
+    "torch>=2.10.0",
 ]
 
 [project.scripts]
 train = "train_tracknet:entrypoint"
+train-events = "train_eventnet:entrypoint"
 infer = "infer_on_video:main"
 webapp = "main:main"

@@ -5,15 +5,19 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 from numpy.typing import NDArray
 from scipy.interpolate import make_interp_spline
 from tqdm import tqdm
 
+from eventnet.dataset import IDX_TO_LABEL, make_heatmaps
+from eventnet.model import HeatmapEventNet, HeatmapEventNetConfig
 from tracknet.model import TrackNet
 
-VIDEO_PATH = Path("/Users/mawwlle/Downloads/video_20250924_190800.mp4")
-WEIGHTS    = Path("weights/tracknet_best.pt")
-OUTPUT     = Path("infer_result_new.mp4")
+VIDEO_PATH       = Path("dataset/videos/soplya_setka/Screen Recording 2026-02-23 at 16.23.03.mov")
+WEIGHTS          = Path("weights/tracknet_best.pt")
+EVENTNET_WEIGHTS = Path("weights/eventnet_best.pt")
+OUTPUT           = Path("infer_result_new.mp4")
 
 TARGET_W       = 640
 TARGET_H       = 360
@@ -22,12 +26,78 @@ TRAIL_WINDOW   = 9
 INFER_STEP     = 3   # run TrackNet every N frames; gaps filled by interpolation
 
 
+_EVENT_COLORS: dict[str, tuple[int, int, int]] = {
+    "hit":    (0,   215, 255),   # gold
+    "bounce": (255, 220, 0),     # cyan
+    "net":    (0,   60,  220),   # red
+    "none":   (120, 120, 120),   # gray
+}
+
+
 def load_model(weights: Path, device: torch.device) -> TrackNet:
     model = TrackNet()
     model.load_state_dict(torch.load(str(weights), map_location=device, weights_only=True))
     model.to(device)
     model.eval()
     return model
+
+
+def load_event_model(
+    weights: Path,
+    device: torch.device,
+) -> tuple[HeatmapEventNet, HeatmapEventNetConfig] | None:
+    """Load HeatmapEventNet from checkpoint. Returns None if weights don't exist yet."""
+    if not weights.exists():
+        return None
+    checkpoint: dict[str, object] = torch.load(str(weights), map_location=device, weights_only=True)
+    cfg = HeatmapEventNetConfig(**checkpoint["cfg"])  # type: ignore[arg-type]
+    model = HeatmapEventNet(cfg)
+    model.load_state_dict(checkpoint["state_dict"])  # type: ignore[arg-type]
+    model.to(device).eval()
+    return model, cfg
+
+
+def classify_events(
+    model: HeatmapEventNet,
+    cfg: HeatmapEventNetConfig,
+    all_positions: dict[int, tuple[float, float]],
+    device: torch.device,
+) -> dict[int, tuple[str, float]]:
+    """Classify game events for every frame using a sliding window of heatmaps.
+
+    Positions from TrackNet are in (TARGET_W × TARGET_H) space; they are
+    normalised to [0, 1] and converted to Gaussian heatmaps matching the
+    resolution used during training.
+    """
+    half = cfg.window_size // 2
+    all_frames = sorted(all_positions)
+    results: dict[int, tuple[str, float]] = {}
+
+    for center in all_frames:
+        positions: tuple[tuple[float, float] | None, ...] = tuple(
+            (all_positions[idx][0] / TARGET_W, all_positions[idx][1] / TARGET_H)
+            if idx in all_positions else None
+            for idx in range(center - half, center + half + 1)
+        )
+        heatmaps = make_heatmaps(positions, cfg.heatmap_w, cfg.heatmap_h, cfg.sigma)
+        tensor = torch.from_numpy(heatmaps).unsqueeze(0).to(device)  # (1, N, H, W)
+        with torch.no_grad():
+            probs = F.softmax(model(tensor), dim=1)[0]
+        label_idx = int(probs.argmax().item())
+        results[center] = (IDX_TO_LABEL[label_idx], float(probs[label_idx].item()))
+
+    return results
+
+
+def _draw_event_label(
+    frame: NDArray[np.uint8],
+    label: str,
+    confidence: float,
+) -> None:
+    color = _EVENT_COLORS[label]
+    text = f"{label}  {confidence:.0%}"
+    cv2.putText(frame, text, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4, cv2.LINE_AA)
+    cv2.putText(frame, text, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color,   2, cv2.LINE_AA)
 
 
 def predict(
@@ -127,6 +197,12 @@ def run(weights: Path, video_path: Path, output: Path) -> None:
     print(f"Device: {device}")
     model = load_model(weights, device)
 
+    event_loaded = load_event_model(EVENTNET_WEIGHTS, device)
+    if event_loaded is None:
+        print("EventNet weights not found — skipping event classification")
+    else:
+        print("EventNet loaded")
+
     cap   = cv2.VideoCapture(str(video_path))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps   = cap.get(cv2.CAP_PROP_FPS)
@@ -159,6 +235,15 @@ def run(weights: Path, video_path: Path, output: Path) -> None:
     print(f"  detected {len(detections)}/{total} frames")
     all_positions = _interpolate(detections)
     print(f"  after interpolation: {len(all_positions)} frames have a position")
+
+    # ── Event classification ───────────────────────────────────────────────────
+    event_labels: dict[int, tuple[str, float]] = {}
+    if event_loaded is not None:
+        print("Classifying events…")
+        event_model, event_cfg = event_loaded
+        event_labels = classify_events(
+            event_model, event_cfg, all_positions, device
+        )
 
     # ── Pass 2: render ────────────────────────────────────────────────────────
     print("Pass 2 — rendering…")
@@ -203,6 +288,10 @@ def run(weights: Path, video_path: Path, output: Path) -> None:
         elif frame_idx in all_positions:
             cx, cy = all_positions[frame_idx]
             _draw_ball(left, cx, cy, detected=False)
+
+        if frame_idx in event_labels:
+            label, conf = event_labels[frame_idx]
+            _draw_event_label(left, label, conf)
 
         # Right: heatmap
         right = _to_heatmap(heatmap)

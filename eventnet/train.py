@@ -1,0 +1,116 @@
+"""HeatmapEventNet training loop."""
+
+import logging
+from pathlib import Path
+
+import torch
+import torch.nn.functional as F
+from torch import Tensor
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+from eventnet.model import HeatmapEventNet, HeatmapEventNetConfig
+
+
+log = logging.getLogger(__name__)
+
+
+def train_epoch(
+    model: HeatmapEventNet,
+    loader: DataLoader[tuple[Tensor, int]],
+    optimizer: torch.optim.Optimizer,
+    class_weights: Tensor,
+    device: torch.device,
+    epoch: int,
+    epochs: int,
+) -> float:
+    model.train()
+    total = 0.0
+    bar = tqdm(loader, desc=f"Epoch {epoch:3d}/{epochs} [train]", leave=False, unit="batch")
+    for heatmaps, labels in bar:
+        heatmaps = heatmaps.to(device)
+        labels = labels.to(device)
+        optimizer.zero_grad()
+        loss = F.cross_entropy(model(heatmaps), labels, weight=class_weights)
+        loss.backward()
+        optimizer.step()
+        total += loss.item()
+        bar.set_postfix(loss=f"{loss.item():.4f}")
+    return total / len(loader)
+
+
+@torch.no_grad()
+def evaluate(
+    model: HeatmapEventNet,
+    loader: DataLoader[tuple[Tensor, int]],
+    class_weights: Tensor,
+    device: torch.device,
+) -> dict[str, float]:
+    model.eval()
+    correct = 0
+    total = 0
+    total_loss = 0.0
+    for heatmaps, labels in loader:
+        heatmaps = heatmaps.to(device)
+        labels = labels.to(device)
+        logits = model(heatmaps)
+        total_loss += F.cross_entropy(logits, labels, weight=class_weights).item()
+        correct += int((logits.argmax(dim=1) == labels).sum().item())
+        total += len(labels)
+    return {
+        "val_loss": total_loss / len(loader),
+        "accuracy": correct / total if total > 0 else 0.0,
+    }
+
+
+def run_training(
+    train_loader: DataLoader[tuple[Tensor, int]],
+    val_loader: DataLoader[tuple[Tensor, int]],
+    cfg: HeatmapEventNetConfig,
+    class_weights: Tensor,
+    epochs: int,
+    lr: float,
+    device: torch.device,
+    output_dir: Path,
+) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(message)s",
+        datefmt="%H:%M:%S",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(output_dir / "eventnet_train.log"),
+        ],
+    )
+
+    model = HeatmapEventNet(cfg).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-3)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
+
+    class_weights = class_weights.to(device)
+    best_acc = 0.0
+    best_path = output_dir / "eventnet_best.pt"
+
+    log.info("Starting HeatmapEventNet training: %d epochs, device=%s", epochs, device)
+
+    for epoch in range(1, epochs + 1):
+        train_loss = train_epoch(model, train_loader, optimizer, class_weights, device, epoch, epochs)
+
+        if epoch % 5 == 0 or epoch == 1:
+            metrics = evaluate(model, val_loader, class_weights, device)
+            scheduler.step(metrics["val_loss"])
+            acc = metrics["accuracy"]
+            log.info(
+                "Epoch %3d/%d  train=%.4f  val=%.4f  acc=%.3f",
+                epoch, epochs, train_loss, metrics["val_loss"], acc,
+            )
+            if acc > best_acc:
+                best_acc = acc
+                torch.save({"state_dict": model.state_dict(), "cfg": cfg.model_dump()}, best_path)
+                log.info("  ✓ new best acc=%.3f  saved → %s", best_acc, best_path)
+        else:
+            log.info("Epoch %3d/%d  train=%.4f", epoch, epochs, train_loss)
+
+    log.info("Done. Best acc=%.3f  weights → %s", best_acc, best_path)
+    return best_path
