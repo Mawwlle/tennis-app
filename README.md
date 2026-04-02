@@ -1,6 +1,6 @@
 # Tennis App
 
-ML-пайплайн для детекции мяча в настольном теннисе и веб-приложение для разметки видео.
+ML-пайплайн для детекции мяча и классификации игровых событий в настольном теннисе + веб-приложение для разметки видео.
 
 ---
 
@@ -13,23 +13,30 @@ dataset/
     ...
   frames/                     — предизвлечённые кадры для обучения (генерируются автоматически)
   ball_annotations.json       — разметка мяча (cx, cy, visibility, source)
-model/                        — Pydantic-схемы и конфиги событийного классификатора
-tracknet/                     — архитектура и датасет TrackNet
+  annotations.json            — разметка событий (hit / bounce / net)
+model/                        — Pydantic-схемы (GameState, BallAnnotation, ...)
+tracknet/                     — детектор мяча
   model.py                    — UNet с depthwise separable свёртками (63K параметров)
   dataset.py                  — PyTorch Dataset с предизвлечением кадров
   train.py                    — тренировочный цикл (focal BCE, Adadelta)
   heatmap.py                  — генерация Gaussian heatmap
+eventnet/                     — классификатор игровых событий
+  model.py                    — HeatmapEventNet: 2D CNN, вход 9 heatmap → 4 класса
+  dataset.py                  — датасет из окон ball_annotations + events
+  train.py                    — тренировочный цикл (cross-entropy с весами классов)
 webapp/                       — FastAPI + одностраничный аннотатор
   static/index.html           — SPA с двумя режимами разметки
-  detector.py                 — YOLO-детектор (стол, сетка, ракетки)
+  detector.py                 — YOLO-детектор мяча
   tracknet_detector.py        — TrackNet-детектор мяча
   ball_storage.py             — хранилище ball-аннотаций
 weights/
-  tracknet_best.pt            — лучшие веса TrackNet по F1 на валидации (~1 MB)
+  tracknet_best.pt            — лучшие веса TrackNet по F1 (~1 MB)
+  eventnet_best.pt            — лучшие веса HeatmapEventNet по accuracy
   tracknet_opt.onnx           — ONNX после упрощения через onnxsim (~918 KB)
-  yolo_det.pt                 — YOLO детекция (ball, table, grid, racket)
-train_tracknet.py             — точка входа для обучения
-infer_on_video.py             — инференс на видео, side-by-side вывод
+  yolo_det.pt                 — YOLO детекция мяча
+train_tracknet.py             — точка входа: обучение TrackNet
+train_eventnet.py             — точка входа: обучение HeatmapEventNet
+infer_on_video.py             — инференс на видео, side-by-side вывод + метки событий
 export_onnx.py                — экспорт TrackNet в ONNX + бенчмарк
 main.py                       — запуск веб-приложения
 ```
@@ -45,16 +52,25 @@ uv run webapp      # открыть http://127.0.0.1:8000
 
 ---
 
-## Обучение TrackNet
+## Обучение
+
+### TrackNet (детекция мяча)
 
 ```bash
 uv run train
-# веса сохраняются в weights/tracknet_best.pt
+# веса → weights/tracknet_best.pt
 ```
 
-Перед первым запуском датасет автоматически предизвлекается в `dataset/frames/` — каждый нужный кадр сохраняется как JPEG 640×360. При повторных запусках пропускаются уже извлечённые файлы.
+Аннотации читаются из `dataset/ball_annotations.json`. При первом запуске кадры автоматически предизвлекаются в `dataset/frames/` как JPEG 640×360.
 
-Аннотации читаются из `dataset/ball_annotations.json`.
+### HeatmapEventNet (классификация событий)
+
+```bash
+uv run train-events
+# веса → weights/eventnet_best.pt
+```
+
+Требует размеченных событий в `dataset/annotations.json` и позиций мяча в `dataset/ball_annotations.json`.
 
 ---
 
@@ -66,10 +82,10 @@ uv run infer
 ```
 
 Вывод — два экрана рядом:
-- **Слева**: трекинг мяча + сплайн-трейл из 9 последних точек
+- **Слева**: трекинг мяча + сплайн-трейл + метка события (hit / bounce / net)
 - **Справа**: тепловая карта (INFERNO colormap)
 
-TrackNet запускается каждые 3 кадра (`INFER_STEP=3`), промежутки заполняются сплайн-интерполяцией.
+TrackNet запускается каждые 3 кадра (`INFER_STEP=3`), промежутки заполняются сплайн-интерполяцией. Если `weights/eventnet_best.pt` не существует — событийная классификация пропускается.
 
 ---
 
@@ -103,21 +119,7 @@ uv run python export_onnx.py
 | `Esc` | сбросить pending-детекцию |
 | `←` / `→` | навигация по кадрам |
 
-**Model-assisted detection** — переключатель в интерфейсе, отключает автодетекцию (полезно при ручной разметке или слабом железе).
-
-**Auto-markup full video** — кнопка запускает TrackNet на всём видео за один проход, заполняя все кадры автоматически. Результат можно потом отредактировать вручную.
-
-Аннотации хранятся в `dataset/ball_annotations.json`:
-```json
-{
-  "videos": {
-    "normal_point/1.mov": [
-      {"frame_idx": 42, "cx": 1234.5, "cy": 678.0, "visibility": 1, "source": "tracknet"},
-      {"frame_idx": 100, "cx": 0, "cy": 0, "visibility": 0, "source": "manual"}
-    ]
-  }
-}
-```
+**Auto-markup full video** — кнопка запускает TrackNet на всём видео за один проход.
 
 ### Режим Events (игровые события)
 
@@ -132,24 +134,36 @@ uv run python export_onnx.py
 
 ---
 
-## Архитектура TrackNet
+## Архитектура
 
-Собственная реализация UNet с depthwise separable свёртками.
+### TrackNet
 
-- **Вход**: 3 последовательных кадра → 9-канальный тензор `(B, 9, 360, 640)`
-- **Выход**: heatmap logits `(B, 1, 360, 640)`, sigmoid → вероятность мяча
+UNet с depthwise separable свёртками.
+
+- **Вход**: 3 последовательных кадра → `(B, 9, 360, 640)`
+- **Выход**: heatmap logits `(B, 1, 360, 640)`
 - **Параметры**: 63K
 - **Каналы**: 9 → 16 → 32 → 64 → 128 → 64 → 32 → 16 → 1
 
-**Почему работает**: энкодер сжимает пространство и учится распознавать движущееся пятно как мяч. Skip connections передают детали с каждого уровня, декодер восстанавливает точную локализацию.
-
-**Depthwise separable**: обычная Conv2d ищет паттерны в пространстве и смешивает каналы одновременно. Здесь разбито на два шага: depthwise (3×3 по каждому каналу отдельно) + pointwise (1×1 для смешивания). Даёт ~8× меньше параметров при схожем качестве.
-
-**Почему лучше YOLO для мяча**:
+Почему лучше YOLO для мяча:
 
 | | YOLO | TrackNet |
 |---|---|---|
 | Контекст | 1 кадр | 3 кадра (видит движение) |
-| Малый размер мяча | плохо | хорошо (тепловая карта) |
+| Малый размер мяча | плохо | хорошо |
 | Смаз при быстром движении | теряет | обрабатывает |
-| Окклюзия | теряет | может предсказать по траектории |
+
+### HeatmapEventNet
+
+2D CNN-классификатор игровых событий по траектории мяча.
+
+- **Вход**: 9 последовательных heatmap → `(B, 9, 36, 64)`
+- **Выход**: `(B, 4)` — логиты классов hit / bounce / net / none
+- **Параметры**: ~15K
+
+Каждая heatmap — Gaussian-блоб в позиции мяча (σ=3 px при разрешении 64×36). 2D свёртки по 9 каналам обучаются распознавать пространственный паттерн движения:
+- **hit**: резкое изменение направления
+- **bounce**: отскок от стола — смена знака вертикальной скорости
+- **net**: остановка / хаотичное движение
+
+Дисбаланс классов компенсируется весами обратной частоты в `cross_entropy`.
