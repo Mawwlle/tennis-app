@@ -11,3 +11,6 @@ wheels/
 
 *.mov
 *.mp4
+
+# Other
+dataset/videos

@@ -11,7 +11,7 @@ from tqdm import tqdm
 
 from tracknet.model import TrackNet
 
-VIDEO_PATH = Path("dataset/videos/sasha_tichka/Screen Recording 2026-02-23 at 16.18.27.mov")
+VIDEO_PATH = Path("/Users/mawwlle/Downloads/video_20250924_190800.mp4")
 WEIGHTS    = Path("weights/tracknet_best.pt")
 OUTPUT     = Path("infer_result_new.mp4")
 
