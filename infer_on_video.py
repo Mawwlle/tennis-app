@@ -10,18 +10,18 @@ from numpy.typing import NDArray
 from scipy.interpolate import make_interp_spline
 from tqdm import tqdm
 
-from eventnet.dataset import IDX_TO_LABEL, make_heatmaps
-from eventnet.model import HeatmapEventNet, HeatmapEventNetConfig
+from eventnet.dataset import IDX_TO_LABEL, extract_kinematics
+from eventnet.model import TCNEventNet, TCNEventNetConfig
 from tracknet.model import TrackNet
 
-VIDEO_PATH       = Path("dataset/videos/soplya_setka/Screen Recording 2026-02-23 at 16.23.03.mov")
+VIDEO_PATH       = Path("test_2.mp4")
 WEIGHTS          = Path("weights/tracknet_best.pt")
 EVENTNET_WEIGHTS = Path("weights/eventnet_best.pt")
 OUTPUT           = Path("infer_result_new.mp4")
 
 TARGET_W       = 640
 TARGET_H       = 360
-CONF_THRESHOLD = 0.98
+CONF_THRESHOLD = 0.6
 TRAIL_WINDOW   = 9
 INFER_STEP     = 3   # run TrackNet every N frames; gaps filled by interpolation
 
@@ -45,29 +45,28 @@ def load_model(weights: Path, device: torch.device) -> TrackNet:
 def load_event_model(
     weights: Path,
     device: torch.device,
-) -> tuple[HeatmapEventNet, HeatmapEventNetConfig] | None:
-    """Load HeatmapEventNet from checkpoint. Returns None if weights don't exist yet."""
+) -> tuple[TCNEventNet, TCNEventNetConfig] | None:
+    """Load TCNEventNet from checkpoint. Returns None if weights don't exist yet."""
     if not weights.exists():
         return None
     checkpoint: dict[str, object] = torch.load(str(weights), map_location=device, weights_only=True)
-    cfg = HeatmapEventNetConfig(**checkpoint["cfg"])  # type: ignore[arg-type]
-    model = HeatmapEventNet(cfg)
+    cfg = TCNEventNetConfig(**checkpoint["cfg"])  # type: ignore[arg-type]
+    model = TCNEventNet(cfg)
     model.load_state_dict(checkpoint["state_dict"])  # type: ignore[arg-type]
     model.to(device).eval()
     return model, cfg
 
 
 def classify_events(
-    model: HeatmapEventNet,
-    cfg: HeatmapEventNetConfig,
+    model: TCNEventNet,
+    cfg: TCNEventNetConfig,
     all_positions: dict[int, tuple[float, float]],
     device: torch.device,
 ) -> dict[int, tuple[str, float]]:
-    """Classify game events for every frame using a sliding window of heatmaps.
+    """Classify game events for every frame using a sliding window of kinematic features.
 
-    Positions from TrackNet are in (TARGET_W × TARGET_H) space; they are
-    normalised to [0, 1] and converted to Gaussian heatmaps matching the
-    resolution used during training.
+    Positions from TrackNet are in (TARGET_W × TARGET_H) space and are
+    normalised to [0, 1] to match what was used during training.
     """
     half = cfg.window_size // 2
     all_frames = sorted(all_positions)
@@ -79,8 +78,8 @@ def classify_events(
             if idx in all_positions else None
             for idx in range(center - half, center + half + 1)
         )
-        heatmaps = make_heatmaps(positions, cfg.heatmap_w, cfg.heatmap_h, cfg.sigma)
-        tensor = torch.from_numpy(heatmaps).unsqueeze(0).to(device)  # (1, N, H, W)
+        feats = extract_kinematics(positions)                    # (N, 8)
+        tensor = torch.from_numpy(feats.T).unsqueeze(0).to(device)  # (1, 8, N)
         with torch.no_grad():
             probs = F.softmax(model(tensor), dim=1)[0]
         label_idx = int(probs.argmax().item())

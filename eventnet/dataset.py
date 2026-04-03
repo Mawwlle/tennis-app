@@ -1,4 +1,4 @@
-"""EventNet dataset: builds 9-heatmap windows from ball + event annotations."""
+"""EventNet dataset: kinematic feature extraction from ball trajectory."""
 
 import random
 from dataclasses import dataclass
@@ -9,8 +9,7 @@ from numpy.typing import NDArray
 from torch import Tensor
 from torch.utils.data import Dataset
 
-from model.schemas import BallAnnotationStore, AnnotationStore
-from tracknet.heatmap import make_heatmap, make_empty_heatmap
+from model.schemas import AnnotationStore, BallAnnotationStore
 
 
 LABEL_TO_IDX: dict[str, int] = {
@@ -21,13 +20,48 @@ LABEL_TO_IDX: dict[str, int] = {
 }
 IDX_TO_LABEL: dict[int, str] = {v: k for k, v in LABEL_TO_IDX.items()}
 NUM_CLASSES: int = 4
+N_FEATURES: int = 8   # cx, cy, dx, dy, d2x, d2y, speed, angle
 
 
 @dataclass(frozen=True)
-class HeatmapEventSample:
-    # Normalized (cx, cy) in [0, 1]; None = ball invisible / not annotated
+class EventSample:
+    # Normalized (cx, cy) in [0, 1]; None = invisible / not annotated
     positions: tuple[tuple[float, float] | None, ...]
     label_idx: int
+
+
+def extract_kinematics(
+    positions: tuple[tuple[float, float] | None, ...],
+) -> NDArray[np.float32]:
+    """Convert a window of normalized (cx, cy) positions to kinematic features.
+
+    Returns (N, 8) array: [cx, cy, dx, dy, d²x, d²y, speed, angle].
+
+    Missing frames (None) contribute zero velocity / acceleration at that step.
+    Angle is normalised to [-1, 1] via division by π.
+    """
+    n = len(positions)
+    feats = np.zeros((n, N_FEATURES), dtype=np.float32)
+
+    for i, pos in enumerate(positions):
+        if pos is not None:
+            feats[i, 0], feats[i, 1] = pos
+
+    for i in range(1, n):
+        if positions[i] is not None and positions[i - 1] is not None:
+            feats[i, 2] = feats[i, 0] - feats[i - 1, 0]   # dx
+            feats[i, 3] = feats[i, 1] - feats[i - 1, 1]   # dy
+
+    for i in range(2, n):
+        if positions[i] is not None and positions[i - 1] is not None and positions[i - 2] is not None:
+            feats[i, 4] = feats[i, 2] - feats[i - 1, 2]   # d²x
+            feats[i, 5] = feats[i, 3] - feats[i - 1, 3]   # d²y
+
+    dx, dy = feats[:, 2], feats[:, 3]
+    feats[:, 6] = np.sqrt(dx ** 2 + dy ** 2)               # speed
+    feats[:, 7] = np.arctan2(dy, dx) / np.pi               # angle ∈ [-1, 1]
+
+    return feats  # (N, 8)
 
 
 def _extract_window(
@@ -64,11 +98,11 @@ def build_samples(
     frame_height: float,
     neg_ratio: float = 2.0,
     rng_seed: int = 42,
-) -> list[HeatmapEventSample]:
+) -> list[EventSample]:
     """Build positive (event) and negative (background) training samples."""
     rng = random.Random(rng_seed)
     half = window_size // 2
-    samples: list[HeatmapEventSample] = []
+    samples: list[EventSample] = []
 
     for video_id, event_annots in event_store.videos.items():
         ball_annots = ball_store.videos.get(video_id, [])
@@ -86,16 +120,9 @@ def build_samples(
         event_frames = {a.frame_idx for a in event_annots}
 
         for annot in event_annots:
-            window = _extract_window(
-                frame_map, annot.frame_idx, half, frame_width, frame_height
-            )
+            window = _extract_window(frame_map, annot.frame_idx, half, frame_width, frame_height)
             if window is not None:
-                samples.append(
-                    HeatmapEventSample(
-                        positions=tuple(window),
-                        label_idx=LABEL_TO_IDX[annot.label],
-                    )
-                )
+                samples.append(EventSample(positions=tuple(window), label_idx=LABEL_TO_IDX[annot.label]))
 
         all_frames = sorted(frame_map.keys())
         candidates = [
@@ -107,62 +134,21 @@ def build_samples(
         n_neg = int(len(event_annots) * neg_ratio)
         chosen = rng.sample(candidates, min(n_neg, len(candidates)))
         for frame_idx in chosen:
-            window = _extract_window(
-                frame_map, frame_idx, half, frame_width, frame_height
-            )
+            window = _extract_window(frame_map, frame_idx, half, frame_width, frame_height)
             if window is not None:
-                samples.append(
-                    HeatmapEventSample(
-                        positions=tuple(window),
-                        label_idx=LABEL_TO_IDX["none"],
-                    )
-                )
+                samples.append(EventSample(positions=tuple(window), label_idx=LABEL_TO_IDX["none"]))
 
     return samples
 
 
-def make_heatmaps(
-    positions: tuple[tuple[float, float] | None, ...],
-    heatmap_w: int,
-    heatmap_h: int,
-    sigma: float,
-) -> NDArray[np.float32]:
-    """Convert normalized positions to stacked heatmaps (N, H, W)."""
-    maps: list[NDArray[np.float32]] = []
-    for pos in positions:
-        if pos is None:
-            maps.append(make_empty_heatmap(heatmap_w, heatmap_h))
-        else:
-            cx_norm, cy_norm = pos
-            maps.append(
-                make_heatmap(
-                    cx_norm * heatmap_w,
-                    cy_norm * heatmap_h,
-                    heatmap_w,
-                    heatmap_h,
-                    sigma=sigma,
-                )
-            )
-    return np.stack(maps)  # (N, H, W)
-
-
-class HeatmapEventDataset(Dataset[tuple[Tensor, int]]):
-    def __init__(
-        self,
-        samples: list[HeatmapEventSample],
-        heatmap_w: int,
-        heatmap_h: int,
-        sigma: float,
-    ) -> None:
+class KinematicEventDataset(Dataset[tuple[Tensor, int]]):
+    def __init__(self, samples: list[EventSample]) -> None:
         self._samples = samples
-        self._heatmap_w = heatmap_w
-        self._heatmap_h = heatmap_h
-        self._sigma = sigma
 
     def __len__(self) -> int:
         return len(self._samples)
 
     def __getitem__(self, idx: int) -> tuple[Tensor, int]:
         s = self._samples[idx]
-        heatmaps = make_heatmaps(s.positions, self._heatmap_w, self._heatmap_h, self._sigma)
-        return torch.from_numpy(heatmaps), s.label_idx  # (N, H, W), int
+        feats = extract_kinematics(s.positions)          # (N, 8)
+        return torch.from_numpy(feats.T), s.label_idx    # (8, N) for Conv1d, int

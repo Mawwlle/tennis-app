@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Research
+
+Эксперименты, что пробовалось и результаты — в `RESEARCH.md`. Там же приоритизированный план улучшений EventNet и ссылки на релевантные статьи (TTNet, OpenTTGames dataset и др.).
+
 ## Commands
 
 ```bash
@@ -39,7 +43,17 @@ Training is orchestrated in `train_tracknet.py` → `tracknet/train.py`. Frames 
 
 Weights live in `weights/tracknet_best.pt`. ONNX variants in `weights/tracknet*.onnx`.
 
-### 3. Inference Pipeline (`infer_on_video.py`)
+### 3. EventNet (`eventnet/`)
+Классификатор игровых событий поверх TrackNet:
+- **Input**: 9 Gaussian heatmap позиций мяча → `(B, 9, 36, 64)`
+- **Output**: 4 класса — hit / bounce / net / none
+- **Loss**: CrossEntropy с inverse-frequency весами (none:bounce:hit:net ≈ 1:4:5:62)
+- Обучается через `uv run train-events` → `weights/eventnet_best.pt`
+- При инференсе `weights/eventnet_best.pt` опциональны — если нет, классификация пропускается
+
+Текущий статус и следующие шаги — в `RESEARCH.md`. Основная проблема: сильный дисбаланс классов (6 net-сэмплов), лучшая стратегия — переход на кинематические фичи + 1D TCN.
+
+### 4. Inference Pipeline (`infer_on_video.py`)
 Two-pass video processing:
 1. Run TrackNet every `INFER_STEP=3` frames, interpolate gaps with scipy spline
 2. Render side-by-side MP4: left = tracking trail, right = INFERNO heatmap

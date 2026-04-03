@@ -1,4 +1,4 @@
-"""HeatmapEventNet training loop."""
+"""TCNEventNet training loop."""
 
 import logging
 from pathlib import Path
@@ -9,14 +9,14 @@ from torch import Tensor
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from eventnet.model import HeatmapEventNet, HeatmapEventNetConfig
+from eventnet.model import TCNEventNet, TCNEventNetConfig
 
 
 log = logging.getLogger(__name__)
 
 
 def train_epoch(
-    model: HeatmapEventNet,
+    model: TCNEventNet,
     loader: DataLoader[tuple[Tensor, int]],
     optimizer: torch.optim.Optimizer,
     class_weights: Tensor,
@@ -27,11 +27,11 @@ def train_epoch(
     model.train()
     total = 0.0
     bar = tqdm(loader, desc=f"Epoch {epoch:3d}/{epochs} [train]", leave=False, unit="batch")
-    for heatmaps, labels in bar:
-        heatmaps = heatmaps.to(device)
+    for feats, labels in bar:
+        feats  = feats.to(device)
         labels = labels.to(device)
         optimizer.zero_grad()
-        loss = F.cross_entropy(model(heatmaps), labels, weight=class_weights)
+        loss = F.cross_entropy(model(feats), labels, weight=class_weights)
         loss.backward()
         optimizer.step()
         total += loss.item()
@@ -41,32 +41,46 @@ def train_epoch(
 
 @torch.no_grad()
 def evaluate(
-    model: HeatmapEventNet,
+    model: TCNEventNet,
     loader: DataLoader[tuple[Tensor, int]],
     class_weights: Tensor,
     device: torch.device,
 ) -> dict[str, float]:
     model.eval()
     correct = 0
-    total = 0
+    total   = 0
     total_loss = 0.0
-    for heatmaps, labels in loader:
-        heatmaps = heatmaps.to(device)
+    per_class_correct: dict[int, int] = {i: 0 for i in range(4)}
+    per_class_total:   dict[int, int] = {i: 0 for i in range(4)}
+
+    for feats, labels in loader:
+        feats  = feats.to(device)
         labels = labels.to(device)
-        logits = model(heatmaps)
+        logits = model(feats)
         total_loss += F.cross_entropy(logits, labels, weight=class_weights).item()
-        correct += int((logits.argmax(dim=1) == labels).sum().item())
-        total += len(labels)
+        preds = logits.argmax(dim=1)
+        correct += int((preds == labels).sum().item())
+        total   += len(labels)
+        for c in range(4):
+            mask = labels == c
+            per_class_correct[c] += int((preds[mask] == c).sum().item())
+            per_class_total[c]   += int(mask.sum().item())
+
+    per_class_acc = {
+        c: per_class_correct[c] / per_class_total[c] if per_class_total[c] > 0 else 0.0
+        for c in range(4)
+    }
     return {
         "val_loss": total_loss / len(loader),
         "accuracy": correct / total if total > 0 else 0.0,
+        **{f"acc_{c}": per_class_acc[c] for c in range(4)},
     }
 
 
 def run_training(
     train_loader: DataLoader[tuple[Tensor, int]],
     val_loader: DataLoader[tuple[Tensor, int]],
-    cfg: HeatmapEventNetConfig,
+    cfg: TCNEventNetConfig,
     class_weights: Tensor,
     epochs: int,
     lr: float,
@@ -84,15 +98,16 @@ def run_training(
         ],
     )
 
-    model = HeatmapEventNet(cfg).to(device)
+    model     = TCNEventNet(cfg).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-3)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
 
     class_weights = class_weights.to(device)
-    best_acc = 0.0
+    best_acc  = 0.0
     best_path = output_dir / "eventnet_best.pt"
 
-    log.info("Starting HeatmapEventNet training: %d epochs, device=%s", epochs, device)
+    n_params = sum(p.numel() for p in model.parameters())
+    log.info("TCNEventNet  params=%d  device=%s  epochs=%d", n_params, device, epochs)
 
     for epoch in range(1, epochs + 1):
         train_loss = train_epoch(model, train_loader, optimizer, class_weights, device, epoch, epochs)
@@ -102,8 +117,10 @@ def run_training(
             scheduler.step(metrics["val_loss"])
             acc = metrics["accuracy"]
             log.info(
-                "Epoch %3d/%d  train=%.4f  val=%.4f  acc=%.3f",
+                "Epoch %3d/%d  train=%.4f  val=%.4f  acc=%.3f  "
+                "[hit=%.2f bounce=%.2f net=%.2f none=%.2f]",
                 epoch, epochs, train_loss, metrics["val_loss"], acc,
+                metrics["acc_0"], metrics["acc_1"], metrics["acc_2"], metrics["acc_3"],
             )
             if acc > best_acc:
                 best_acc = acc
