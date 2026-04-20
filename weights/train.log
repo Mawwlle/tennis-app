@@ -1,0 +1,25 @@
+18:56:01  Loaded pretrained weights from weights/tracknet_best.pt
+18:56:01  Starting training: 30 epochs, device=mps
+19:00:25  Epoch   1/30  train=0.0052  val=0.0051  P=0.715  R=0.701  F1=0.706
+19:00:25    ✓ new best F1=0.706  saved → weights/tracknet_best.pt
+19:04:57  Epoch   2/30  train=0.0027
+19:09:37  Epoch   3/30  train=0.0022
+19:16:38  Epoch   4/30  train=0.0020
+19:19:44  Epoch   5/30  train=0.0019  val=0.0039  P=0.859  R=0.825  F1=0.834
+19:19:45    ✓ new best F1=0.834  saved → weights/tracknet_best.pt
+19:22:54  Epoch   6/30  train=0.0018
+19:26:06  Epoch   7/30  train=0.0017
+19:28:43  Epoch   8/30  train=0.0017
+19:32:05  Epoch   9/30  train=0.0016
+19:35:48  Epoch  10/30  train=0.0016  val=0.0038  P=0.880  R=0.859  F1=0.866
+19:35:48    ✓ new best F1=0.866  saved → weights/tracknet_best.pt
+19:39:11  Epoch  11/30  train=0.0016
+19:42:53  Epoch  12/30  train=0.0015
+19:46:42  Epoch  13/30  train=0.0015
+19:50:06  Epoch  14/30  train=0.0015
+19:54:14  Epoch  15/30  train=0.0015  val=0.0036  P=0.913  R=0.892  F1=0.898
+19:54:14    ✓ new best F1=0.898  saved → weights/tracknet_best.pt
+19:58:01  Epoch  16/30  train=0.0015
+20:03:13  Epoch  17/30  train=0.0015
+20:08:30  Epoch  18/30  train=0.0015
+20:16:02  Epoch  19/30  train=0.0015

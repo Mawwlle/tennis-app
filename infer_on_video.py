@@ -14,16 +14,16 @@ from eventnet.dataset import IDX_TO_LABEL, extract_kinematics
 from eventnet.model import TCNEventNet, TCNEventNetConfig
 from tracknet.model import TrackNet
 
-VIDEO_PATH       = Path("test_2.mp4")
+VIDEO_PATH       = Path("/Users/mawwlle/Downloads/night_tennis.mp4")
 WEIGHTS          = Path("weights/tracknet_best.pt")
 EVENTNET_WEIGHTS = Path("weights/eventnet_best.pt")
 OUTPUT           = Path("infer_result_new.mp4")
 
 TARGET_W       = 640
 TARGET_H       = 360
-CONF_THRESHOLD = 0.6
+CONF_THRESHOLD = 0.99
 TRAIL_WINDOW   = 9
-INFER_STEP     = 3   # run TrackNet every N frames; gaps filled by interpolation
+INFER_STEP     = 5   # run TrackNet every N frames; gaps filled by interpolation
 
 
 _EVENT_COLORS: dict[str, tuple[int, int, int]] = {

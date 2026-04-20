@@ -27,7 +27,8 @@ def _video_id_from_path(path: Path, dataset_dir: Path) -> str:
 
 def list_videos(dataset_dir: Path) -> list[VideoEntry]:
     entries: list[VideoEntry] = []
-    for video_path in sorted(dataset_dir.rglob("*.mov")):
+    videos = list(dataset_dir.rglob("*.mov")) + list(dataset_dir.rglob("*.mp4"))
+    for video_path in sorted(videos):
         video_id = _video_id_from_path(video_path, dataset_dir)
         entries.append(
             VideoEntry(

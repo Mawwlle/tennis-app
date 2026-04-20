@@ -183,6 +183,7 @@ def run_training(
     lr: float,
     device: torch.device,
     output_dir: Path,
+    pretrained_path: Path | None = None,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
@@ -195,7 +196,11 @@ def run_training(
         ],
     )
 
-    model     = TrackNet().to(device)
+    model = TrackNet().to(device)
+    if pretrained_path is not None:
+        model.load_state_dict(torch.load(pretrained_path, map_location=device))
+        log.info("Loaded pretrained weights from %s", pretrained_path)
+
     optimizer = torch.optim.Adadelta(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
 
