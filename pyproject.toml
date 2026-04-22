@@ -20,11 +20,16 @@ dependencies = [
     "onnxscript>=0.6.2",
     "matplotlib>=3.10.8",
     "torch>=2.10.0",
+    "synth-client",
 ]
 
 [project.scripts]
 train = "train_tracknet:entrypoint"
 train-events = "train_eventnet:entrypoint"
 train-seg = "train_seg:entrypoint"
+segment = "segment_video:main"
 infer = "infer_on_video:main"
 webapp = "main:main"
+
+[tool.uv.sources]
+synth-client = { git = "https://gitlab.actcognitive.org/Mawlle/synth.git", subdirectory = "synth-client" }

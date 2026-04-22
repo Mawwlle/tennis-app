@@ -19,13 +19,17 @@ import numpy as np
 from pydantic import BaseModel
 from synth_client import BoundingBox, SynthClient
 
-VIDEO_PATH = Path("test_2.mp4")
+VIDEO_PATHS: list[Path] = [
+    Path("test_2.mp4"),
+    Path("dataset/videos/night_videos/part_1.mp4"),
+    Path("dataset/videos/sasha_tichka/Screen Recording 2026-02-23 at 16.18.27.mov"),
+    Path("dataset/videos/soplya_setka/Screen Recording 2026-02-23 at 16.23.03.mov"),
+]
 OUTPUT_DIR = Path("annotations_output")
 FRAMES_DIR = OUTPUT_DIR / "frames"
 LABELS_DIR = OUTPUT_DIR / "labels"
 FRAME_STEP = 6
 SYNTH_BASE_URL = "http://10.32.11.23"
-MATRIX_PATH = OUTPUT_DIR / "verification_matrix.jpg"
 CLASSES = ["net", "table"]
 
 
@@ -47,20 +51,29 @@ class FrameSegmentation(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+def _video_prefix(video_path: Path) -> str:
+    """Slug from video stem — used as filename prefix to avoid collisions."""
+    return video_path.stem.replace(" ", "_")[:40]
+
+
 def extract_frames(
     video_path: Path,
     frames_dir: Path,
     step: int,
 ) -> list[tuple[int, Path]]:
-    """Extract every `step`-th frame. Returns list of (original_frame_idx, saved_path)."""
+    """Extract every `step`-th frame. Returns list of (original_frame_idx, saved_path).
+
+    Filenames include the video prefix so frames from different videos never clash.
+    """
     frames_dir.mkdir(parents=True, exist_ok=True)
+    prefix = _video_prefix(video_path)
     cap = cv2.VideoCapture(str(video_path))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
     extracted: list[tuple[int, Path]] = []
     frame_idx = 0
 
-    print(f"Extracting every {step}nd frame from {total} total frames...")
+    print(f"[{prefix}] Extracting every {step}th frame from {total} total...")
 
     while True:
         ret, frame = cap.read()
@@ -68,17 +81,17 @@ def extract_frames(
             break
 
         if frame_idx % step == 0 and frame is not None:
-            path = frames_dir / f"frame_{frame_idx:06d}.jpg"
+            path = frames_dir / f"{prefix}_{frame_idx:06d}.jpg"
             cv2.imwrite(str(path), frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
             extracted.append((frame_idx, path))
 
         frame_idx += 1
 
         if frame_idx % 500 == 0:
-            print(f"  processed {frame_idx}/{total}, extracted {len(extracted)}")
+            print(f"  {frame_idx}/{total}, extracted {len(extracted)}")
 
     cap.release()
-    print(f"Extracted {len(extracted)} frames to {frames_dir}")
+    print(f"  → {len(extracted)} frames saved to {frames_dir}")
     return extracted
 
 
@@ -182,14 +195,12 @@ def segment_frame(
     for box in net_boxes:
         box.label = "net"
 
-    table_boxes = segment_table_by_color(img)
-
     return FrameSegmentation(
         frame_idx=frame_idx,
         image_path=image_path,
         width=w,
         height=h,
-        boxes=net_boxes + table_boxes,
+        boxes=net_boxes,
     )
 
 
@@ -254,7 +265,7 @@ def save_yolo_seg(
             if line is not None:
                 lines.append(line)
 
-        label_path = labels_dir / f"frame_{seg.frame_idx:06d}.txt"
+        label_path = labels_dir / f"{seg.image_path.stem}.txt"
         label_path.write_text("\n".join(lines) + ("\n" if lines else ""))
 
     print(f"YOLO-seg labels saved to {labels_dir}")
@@ -277,12 +288,14 @@ def save_coco(
 
     images: list[dict] = []
     annotations: list[dict] = []
+    # Use a global counter for image_id so frames from different videos never clash
+    img_id = 0
     ann_id = 0
 
     for seg in segmentations:
         images.append(
             {
-                "id": seg.frame_idx,
+                "id": img_id,
                 "file_name": seg.image_path.name,
                 "width": seg.width,
                 "height": seg.height,
@@ -308,7 +321,7 @@ def save_coco(
             annotations.append(
                 {
                     "id": ann_id,
-                    "image_id": seg.frame_idx,
+                    "image_id": img_id,
                     "category_id": cat_id,
                     "bbox": [box.x_min, box.y_min, bw, bh],
                     "segmentation": segmentation,
@@ -317,6 +330,8 @@ def save_coco(
                 }
             )
             ann_id += 1
+
+        img_id += 1
 
     output_path.write_text(
         json.dumps(
@@ -430,22 +445,33 @@ def build_verification_matrix(
 
 def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    frames = extract_frames(VIDEO_PATH, FRAMES_DIR, FRAME_STEP)
     class_map = {name: i for i, name in enumerate(CLASSES)}
 
-    with SynthClient(base_url=SYNTH_BASE_URL) as client:
-        segmentations = run_segmentations(client, frames)
+    all_segmentations: list[FrameSegmentation] = []
 
-    save_yolo_seg(segmentations, LABELS_DIR, class_map)
-    save_coco(segmentations, OUTPUT_DIR / "annotations_coco.json")
-    build_verification_matrix(segmentations, MATRIX_PATH)
+    with SynthClient(base_url=SYNTH_BASE_URL) as client:
+        for video_path in VIDEO_PATHS:
+            if not video_path.exists():
+                print(f"SKIP (not found): {video_path}")
+                continue
+
+            print(f"\n=== {video_path.name} ===")
+            frames = extract_frames(video_path, FRAMES_DIR, FRAME_STEP)
+            segmentations = run_segmentations(client, frames)
+            all_segmentations.extend(segmentations)
+
+            # Per-video verification matrix
+            matrix_path = OUTPUT_DIR / f"matrix_{_video_prefix(video_path)}.jpg"
+            build_verification_matrix(segmentations, matrix_path)
+
+    save_yolo_seg(all_segmentations, LABELS_DIR, class_map)
+    save_coco(all_segmentations, OUTPUT_DIR / "annotations_coco.json")
 
     print("\nDone.")
+    print(f"  Total frames:    {len(all_segmentations)}")
     print(f"  Frames:          {FRAMES_DIR}")
     print(f"  YOLO-seg labels: {LABELS_DIR}")
     print(f"  COCO JSON:       {OUTPUT_DIR / 'annotations_coco.json'}")
-    print(f"  Matrix:          {MATRIX_PATH}")
 
 
 if __name__ == "__main__":

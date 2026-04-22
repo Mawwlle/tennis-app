@@ -14,7 +14,7 @@ from eventnet.dataset import IDX_TO_LABEL, extract_kinematics
 from eventnet.model import TCNEventNet, TCNEventNetConfig
 from tracknet.model import TrackNet
 
-VIDEO_PATH       = Path("dataset/videos/night_videos/part_1.mp4")
+VIDEO_PATH       = Path("test_2.mp4")
 WEIGHTS          = Path("weights/tracknet_best.pt")
 EVENTNET_WEIGHTS = Path("weights/eventnet_best.pt")
 OUTPUT           = Path("infer_result_new.mp4")

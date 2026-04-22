@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import torch
@@ -12,6 +13,13 @@ from torch.utils.data import DataLoader, random_split
 
 from segnet.dataset import SegNetDataset
 from segnet.model import SegNet
+
+
+def _atomic_save(obj: object, path: Path) -> None:
+    """Save to a temp file then rename — prevents corrupted checkpoints on crash."""
+    tmp = path.with_suffix(".tmp")
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
 
 
 def run_training(
@@ -79,7 +87,7 @@ def run_training(
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(model.state_dict(), weights_dir / "segnet_best.pt")
+            _atomic_save(model.state_dict(), weights_dir / "segnet_best.pt")
             print(f"  → saved (val_loss={val_loss:.4f})")
 
-    torch.save(model.state_dict(), weights_dir / "segnet_last.pt")
+    _atomic_save(model.state_dict(), weights_dir / "segnet_last.pt")
