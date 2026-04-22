@@ -25,5 +25,6 @@ dependencies = [
 [project.scripts]
 train = "train_tracknet:entrypoint"
 train-events = "train_eventnet:entrypoint"
+train-seg = "train_seg:entrypoint"
 infer = "infer_on_video:main"
 webapp = "main:main"
