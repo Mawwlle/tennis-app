@@ -1,4 +1,4 @@
-"""Parser for OpenTTGames dataset annotations → EventSample list.
+"""Parser for OpenTTGames dataset annotations → HeatmapEventSample list.
 
 Expected dataset layout (after download)::
 
@@ -22,68 +22,87 @@ events_markup.json::
 
 Label mapping
 -------------
-- "bounce"      → bounce
-- "net"         → net
-- "empty_event" → skipped by default (racket contact near table, no clear trajectory change)
+- "bounce"      → bounce  (table bounce — clear trajectory reversal)
+- "net"         → skipped (net class removed)
+- "empty_event" → skipped (ambiguous racket contact)
 """
 
+from __future__ import annotations
+
 import json
+import random
 from pathlib import Path
 
-from eventnet.dataset import LABEL_TO_IDX, EventSample, _extract_window
-
+from eventnet.dataset import LABEL_TO_IDX
+from eventnet.heatmap import (
+    SMOOTH_RADIUS,
+    HeatmapEventSample,
+    _smooth_weight,
+    positions_to_heatmaps,
+)
 
 _FRAME_WIDTH  = 1920.0
 _FRAME_HEIGHT = 1080.0
 
 _LABEL_MAP: dict[str, str | None] = {
     "bounce":      "bounce",
-    "net":         "net",
-    "empty_event": None,    # skipped — ambiguous label (racket contact w/o clear physics change)
+    "net":         None,
+    "empty_event": None,
 }
 
 
 def _load_ball_markup(path: Path) -> dict[int, tuple[float, float]]:
-    """Parse ball_markup.json → {frame_idx: (x, y)}, excluding absent frames."""
+    """Parse ball_markup.json → {frame_idx: (x_norm, y_norm)}, excluding absent frames."""
     raw: dict[str, dict[str, int]] = json.loads(path.read_text())
     frame_map: dict[int, tuple[float, float]] = {}
     for frame_str, coords in raw.items():
         x, y = coords["x"], coords["y"]
         if x >= 0 and y >= 0:
-            frame_map[int(frame_str)] = (float(x), float(y))
+            frame_map[int(frame_str)] = (float(x) / _FRAME_WIDTH, float(y) / _FRAME_HEIGHT)
     return frame_map
 
 
 def _load_events_markup(path: Path) -> dict[int, str]:
-    """Parse events_markup.json → {frame_idx: event_string}."""
     raw: dict[str, str] = json.loads(path.read_text())
     return {int(k): v for k, v in raw.items()}
 
 
-def build_openttgames_samples(
+def _extract_window_norm(
+    frame_map: dict[int, tuple[float, float]],
+    center: int,
+    half: int,
+) -> list[tuple[float, float] | None] | None:
+    """Extract window of already-normalized positions. Returns None if >50% missing."""
+    n = 2 * half + 1
+    window: list[tuple[float, float] | None] = []
+    missing = 0
+    for idx in range(center - half, center + half + 1):
+        pos = frame_map.get(idx)
+        window.append(pos)
+        if pos is None:
+            missing += 1
+    if missing > n // 2:
+        return None
+    return window
+
+
+def build_openttgames_heatmap_samples(
     data_dir: Path,
-    window_size: int = 9,
-    frame_width: float = _FRAME_WIDTH,
-    frame_height: float = _FRAME_HEIGHT,
-) -> list[EventSample]:
-    """Load all games under data_dir and return EventSample list.
+    window_size: int = 15,
+    smooth_radius: int = SMOOTH_RADIUS,
+    neg_ratio: float = 3.0,
+    rng_seed: int = 42,
+) -> list[HeatmapEventSample]:
+    """Load all games and return HeatmapEventSample list with smooth labeling.
 
-    Only bounce and net events are included (empty_event is skipped).
-    Windows where >50% of frames are missing are also discarded.
-
-    Args:
-        data_dir:     Root of the OpenTTGames download
-                      (contains game_1/, game_2/, ... sub-directories).
-        window_size:  Must match the window_size used in the main dataset.
-        frame_width:  Video width in pixels (1920 for OpenTTGames).
-        frame_height: Video height in pixels (1080 for OpenTTGames).
-
-    Returns:
-        List of EventSample with label_idx in {bounce=1, net=2}.
+    Only bounce events are used (net/empty_event skipped).
+    Uses TTNet-style smooth temporal labeling: each event expands to
+    (2*smooth_radius+1) samples with decaying sin weights.
     """
-    half    = window_size // 2
-    samples: list[EventSample] = []
-    skipped_missing = 0
+    rng  = random.Random(rng_seed)
+    half = window_size // 2
+    samples: list[HeatmapEventSample] = []
+    skipped = 0
     counts: dict[str, int] = {}
 
     game_dirs = sorted(p for p in data_dir.iterdir() if p.is_dir())
@@ -99,22 +118,53 @@ def build_openttgames_samples(
         frame_map = _load_ball_markup(ball_path)
         events    = _load_events_markup(events_path)
 
+        event_frames: set[int] = set()
+
+        # ── Positive samples with smooth labeling ─────────────────────────────
         for frame_idx, event_str in events.items():
             label = _LABEL_MAP.get(event_str)
             if label is None:
                 continue
+            label_idx = LABEL_TO_IDX[label]
+            event_frames.add(frame_idx)
 
-            window = _extract_window(frame_map, frame_idx, half, frame_width, frame_height)
+            for d in range(-smooth_radius, smooth_radius + 1):
+                center = frame_idx + d
+                window = _extract_window_norm(frame_map, center, half)
+                if window is None:
+                    skipped += 1
+                    continue
+                hm = positions_to_heatmaps(tuple(window))
+                w  = _smooth_weight(d, smooth_radius)
+                samples.append(HeatmapEventSample(heatmaps=hm, label_idx=label_idx, weight=w))
+                counts[label] = counts.get(label, 0) + 1
+
+        # ── Negative samples ──────────────────────────────────────────────────
+        all_frames = sorted(frame_map.keys())
+        candidates = [
+            f for f in all_frames
+            if all(abs(f - ef) > half + smooth_radius for ef in event_frames)
+            and f >= all_frames[0] + half
+            and f <= all_frames[-1] - half
+        ]
+        n_event = sum(1 for ev in events.values() if _LABEL_MAP.get(ev) is not None)
+        n_neg   = int(n_event * neg_ratio)
+        chosen  = rng.sample(candidates, min(n_neg, len(candidates)))
+        for fi in chosen:
+            window = _extract_window_norm(frame_map, fi, half)
             if window is None:
-                skipped_missing += 1
                 continue
+            hm = positions_to_heatmaps(tuple(window))
+            samples.append(HeatmapEventSample(
+                heatmaps=hm,
+                label_idx=LABEL_TO_IDX["none"],
+                weight=1.0,
+            ))
 
-            samples.append(EventSample(positions=tuple(window), label_idx=LABEL_TO_IDX[label]))
-            counts[label] = counts.get(label, 0) + 1
-
+    raw_events = sum(counts.values()) // (2 * smooth_radius + 1)
     print(
         f"OpenTTGames: {len(game_dirs)} games, "
-        f"{sum(counts.values())} samples {counts}, "
-        f"{skipped_missing} skipped (missing frames)"
+        f"~{raw_events} events → {sum(counts.values())} augmented samples {counts}, "
+        f"{skipped} skipped (missing frames)"
     )
     return samples

@@ -72,6 +72,21 @@ uv run train-events
 
 Требует размеченных событий в `dataset/annotations.json` и позиций мяча в `dataset/ball_annotations.json`.
 
+### Unified Calibration Segmentation
+
+```bash
+uv run train-seg
+# веса → weights/calibration_seg_best.pt
+# график метрик → weights/calibration_seg_metrics.png
+```
+
+Этот пайплайн автоматически:
+- докачивает OpenTTGames training videos и segmentation masks
+- собирает единый YOLO-seg датасет из локальных `net/table` аннотаций и OpenTTGames `person/table`
+- обучает один segmentation model для `net / table / person`
+
+Важно: OpenTTGames не размечает `net`, поэтому класс сетки по-прежнему приходит из локальной разметки.
+
 ---
 
 ## Инференс на видео

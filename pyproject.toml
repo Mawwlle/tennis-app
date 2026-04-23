@@ -28,6 +28,7 @@ train = "train_tracknet:entrypoint"
 train-events = "train_eventnet:entrypoint"
 train-seg = "train_seg:entrypoint"
 segment = "segment_video:main"
+score = "score:main"
 infer = "infer_on_video:main"
 webapp = "main:main"
 

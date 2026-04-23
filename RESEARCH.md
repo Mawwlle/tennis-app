@@ -182,6 +182,137 @@ Per-class: hit=0.71  bounce=0.98  net=0.98  none=0.94
 
 ---
 
+## Эксперимент 5 — Убрать net-класс, добавить net geometry + player geometry фичи
+
+**Дата**: 2026-04-23
+**Статус**: ✅ завершён (обучение), ❌ inference плохой
+
+### Что делали
+- Убрали net-класс → 3 класса: hit / bounce / none
+- Добавили 4 фичи расстояния до ракетки: dist_x/y_left, dist_x/y_right
+- Убрали YOLO-seg из training pipeline (используем default NetGeometry)
+- N_FEATURES: 10 → 14, num_classes: 4 → 3
+- OpenTTGames: bounce только (net теперь пропускается)
+- Smooth labels — нет (добавили позже)
+
+### Результат обучения
+```
+Own samples: 372
+OpenTTGames: 12 games, 1770 samples {'bounce': 1770}
+Total: 2142 (hit=50, bounce=1838, none=254)
+Best val accuracy: 0.993 (epoch 240)
+Per-class: hit=0.90  bounce=0.99  none=1.00
+Training time: ~2 мин на cuda
+```
+
+### Проблема
+**Hit детектируется там где не должен** — inference не работает.
+- val accuracy 99.3% но false positive rate высокий на реальном видео
+- Корень: запускаем EventNet на *каждом кадре* all_positions (~5000+ кадров)
+- При 1% false positive rate → 50 ложных hit на 5000 кадров
+- Kinematic features noisy: интерполяция сглаживает артефакты детекции, модель учится на "чистых" данных, inference получает "грязные"
+
+---
+
+## Эксперимент 6 — HeatmapEventNet (TTNet approach)
+
+**Дата**: 2026-04-23
+**Статус**: 🔄 в процессе
+
+### Идея (из TTNet, CVPRW 2020)
+TTNet не использует скалярные (cx, cy) — он берёт **feature maps из детектора** как вход для event head. Ключевые идеи:
+1. **Spatial context**: сеть видит *где в кадре* мяч — низ кадра = стол = bounce, верх = игрок = hit
+2. **Sin smooth labeling**: `weight = sin((R - |d| + 1) * π / (2*(R+1)))` для d ∈ {-R…R} вокруг каждого события → в 7× больше hit samples (50 → 350)
+3. **BCEWithLogitsLoss** (sigmoid, не softmax) — каждый класс независим
+4. **Heatmap dropout 50%** при обучении → имитирует INFER_STEP=3 (inference видит только каждый 3-й кадр)
+5. **Confidence threshold** вместо argmax + peak picking → не классифицируем каждый кадр подряд
+
+### Архитектура HeatmapEventNet
+```
+Input: (B, 15, 36, 64)  — window of downscaled ball detection heatmaps
+
+Shared spatial encoder (per frame):
+  Conv2d(1 → 16, 3×3) → BN → ReLU
+  Conv2d(16 → 24, 3×3, stride=2) → BN → ReLU  # 18×32
+  Conv2d(24 → 32, 3×3, stride=2) → BN → ReLU  # 9×16
+  AdaptiveAvgPool2d(1) → Flatten                 # → 32-dim per frame
+
+Temporal TCN: (B, 32, 15) → 3 dilated blocks → (B, 64, 15)
+Head: AdaptiveAvgPool1d → Flatten → Dropout(0.3) → Linear(64, 3)
+
+Output: (B, 3) raw logits for BCEWithLogitsLoss
+Params: ~100K    Inference: < 3ms on CPU
+```
+
+### Ключевые изменения в pipeline
+- **Training**: синтетические Gaussian blobs из аннотаций (cx, cy) → 36×64 heatmaps
+- **Inference** (`score.py`): Pass 1 сохраняет downscaled TrackNet heatmaps в `hm_cache` → detect_hits использует реальные heatmaps
+- `openttgames.py`: переписан на `build_openttgames_heatmap_samples` с smooth labeling
+- `train_eventnet.py`: убраны player_geometry и net_geometry pre-computation
+- `eventnet/train.py`: `_weighted_bce` с per-sample weights, CosineAnnealingLR
+
+### Файлы
+- `eventnet/heatmap.py` — новый: HeatmapEventSample, HeatmapEventDataset, build_heatmap_samples, smooth labeling utils
+- `eventnet/model.py` — добавлены HeatmapEventNet, HeatmapEventNetConfig (TCNEventNet сохранён как legacy)
+- `eventnet/train.py` — переписан на BCEWithLogitsLoss + weighted loss
+- `eventnet/openttgames.py` — переписан на heatmap samples
+
+---
+
+## Эксперимент 7 — Rule-based scoring без EventNet
+
+**Дата**: 2026-04-23
+**Статус**: 🔄 в процессе
+
+### Решение
+- Оставляем `TrackNet + interpolation + net geometry`
+- Полностью убираем `EventNet` из `score.py`
+- **Hit** детектируем по локальным экстремумам `x(t)`:
+  - локальный минимум = удар слева
+  - локальный максимум = удар справа
+- **Bounce** детектируем по локальным максимумам `y(t)` после сглаживания траектории
+- **Net** детектируем как неудачный перелёт после `hit`:
+  - был удар
+  - не было валидного bounce на чужой стороне
+  - траектория либо закончилась у сетки, либо не пересекла её
+- Поверх событий строим FSM для счёта:
+  - `hit` → ждём bounce на стороне соперника
+  - `bounce` → ждём ответный `hit`
+  - второй `bounce` на той же стороне = очко сопернику
+  - `net` или потеря мяча до валидного bounce = очко сопернику
+
+### Почему
+- Трекинг уже хороший, а `eventnet` даёт слишком много ложных срабатываний
+- Для score overlay важнее стабильная физика ралли, чем frame-wise классификация каждого кадра
+- Эвристики по траектории проще отлаживать на edge device и легче интерпретировать
+
+---
+
+## Эксперимент 8 — Hit pseudo-labels из OpenTTGames траекторий
+
+**Дата**: 2026-04-23
+**Статус**: 🔄 запланирован
+
+### Проблема
+OpenTTGames не размечает хиты (только bounce/net/empty_event).
+Из-за этого hit обучается только на 50 собственных сэмплах → hit accuracy = 0.71.
+
+### Решение
+Генерировать hit псевдо-разметку из `ball_markup.json` через детекцию смены знака dx:
+- Хит = локальный экстремум cx: `dx[f] * dx[f+1] < 0` с `speed > _HIT_MIN_DX`
+- Фильтрация: cx вне net-зоны (0.38–0.62) и `_HIT_MIN_EVENT_GAP = 10` от размеченных событий
+- Smooth labeling (±3 кадра) применяется так же, как к размеченным bounce
+
+### Изменения
+- `eventnet/openttgames.py`: добавлена `_detect_hit_frames()` + интеграция в `build_openttgames_heatmap_samples`
+- Параметры: `_HIT_MIN_DX=0.008` (≈15px при 1920), `_HIT_NET_ZONE=(0.38, 0.62)`, `_HIT_MAX_FRAME_GAP=4`
+
+### Ожидаемый результат
+- Hit: 0.71 → ~0.90+ (если OpenTTGames ball_markup.json покрывает весь ролик)
+- Общая accuracy: ~97% → ~99%+
+
+---
+
 ## Следующие шаги (приоритет)
 
 | # | Что | Ожидаемый прирост | Усилие |

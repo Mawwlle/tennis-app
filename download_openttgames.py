@@ -1,9 +1,12 @@
-"""Download OpenTTGames dataset (annotations and/or videos).
+"""Download OpenTTGames dataset (annotations, segmentation masks and/or videos).
 
 Usage::
 
-    # Annotations only (~1.5 MB, needed for EventNet / TCN training)
+    # JSON annotations only (~1.5 MB, needed for EventNet / TCN training)
     uv run python download_openttgames.py
+
+    # JSON annotations + segmentation masks (needed for unified segmentation)
+    uv run python download_openttgames.py --masks
 
     # Annotations + videos (~50 GB, needed for TrackNet training)
     uv run python download_openttgames.py --video
@@ -24,12 +27,19 @@ from urllib.error import URLError
 # Official dataset page: https://lab.osai.ai/datasets/openttgames/
 _BASE_URL = "https://lab.osai.ai/datasets/openttgames"
 
-_TRAINING_GAMES = ["game_1", "game_2", "game_3", "game_4", "game_5"]
-_TEST_GAMES     = ["test_1", "test_2", "test_3", "test_4", "test_5", "test_6", "test_7"]
-_GAMES          = _TRAINING_GAMES + _TEST_GAMES
+TRAINING_GAMES = ["game_1", "game_2", "game_3", "game_4", "game_5"]
+TEST_GAMES     = ["test_1", "test_2", "test_3", "test_4", "test_5", "test_6", "test_7"]
+GAMES          = TRAINING_GAMES + TEST_GAMES
 
-_OUTPUT_DIR       = Path("dataset/openttgames")
-_ANNOTATION_FILES = {"ball_markup.json", "events_markup.json"}
+OUTPUT_DIR        = Path("dataset/openttgames")
+ANNOTATION_FILES  = {"ball_markup.json", "events_markup.json"}
+SEGMENT_MASK_GLOB = "*.png"
+
+_TRAINING_GAMES = TRAINING_GAMES
+_TEST_GAMES = TEST_GAMES
+_GAMES = GAMES
+_OUTPUT_DIR = OUTPUT_DIR
+_ANNOTATION_FILES = ANNOTATION_FILES
 
 
 def _download_stream(url: str, dest: Path, desc: str = "") -> None:
@@ -60,31 +70,47 @@ def _download_bytes(url: str) -> bytes:
         return resp.read()
 
 
-def _extract_annotations(archive_bytes: bytes, dest: Path) -> bool:
-    """Extract only JSON annotation files from a ZIP archive."""
+def _extract_markup(archive_bytes: bytes, dest: Path, include_masks: bool) -> bool:
+    """Extract JSON annotation files and optionally segmentation masks."""
     dest.mkdir(parents=True, exist_ok=True)
     extracted = False
     with zipfile.ZipFile(io.BytesIO(archive_bytes)) as zf:
         for name in zf.namelist():
             filename = Path(name).name
-            if filename in _ANNOTATION_FILES:
+            if filename in ANNOTATION_FILES:
                 data = zf.read(name)
                 (dest / filename).write_bytes(data)
                 print(f"    ✓ {filename}  ({len(data):,} bytes)")
                 extracted = True
+                continue
+
+            if include_masks and filename.lower().endswith(".png"):
+                data = zf.read(name)
+                (dest / filename).write_bytes(data)
+                extracted = True
     return extracted
 
 
-def download_annotations(games: list[str]) -> list[str]:
-    """Download JSON annotation archives. Returns list of failed games."""
+def _has_required_markup(dest: Path, include_masks: bool) -> bool:
+    have_json = all((dest / filename).exists() for filename in ANNOTATION_FILES)
+    if not have_json:
+        return False
+    if not include_masks:
+        return True
+    return any(dest.glob(SEGMENT_MASK_GLOB))
+
+
+def download_annotations(games: list[str], include_masks: bool = False) -> list[str]:
+    """Download JSON annotations and optional segmentation masks."""
     failed: list[str] = []
     for game in games:
-        dest = _OUTPUT_DIR / game
-        if (dest / "ball_markup.json").exists() and (dest / "events_markup.json").exists():
-            print(f"[skip] {game}  (annotations already present)")
+        dest = OUTPUT_DIR / game
+        if _has_required_markup(dest, include_masks):
+            suffix = " + masks" if include_masks else ""
+            print(f"[skip] {game}  (annotations{suffix} already present)")
             continue
 
-        print(f"[{game}] annotations")
+        print(f"[{game}] annotations{' + masks' if include_masks else ''}")
         urls = [
             f"{_BASE_URL}/data/{game}.zip",
             f"{_BASE_URL}/{game}.zip",
@@ -93,11 +119,11 @@ def download_annotations(games: list[str]) -> list[str]:
         for url in urls:
             try:
                 data = _download_bytes(url)
-                if _extract_annotations(data, dest):
+                if _extract_markup(data, dest, include_masks=include_masks):
                     success = True
                     break
                 else:
-                    print("    ✗ archive has no annotation JSONs")
+                    print("    ✗ archive has no required markup files")
             except URLError as exc:
                 print(f"    ✗ {exc}")
 
@@ -111,7 +137,7 @@ def download_videos(games: list[str]) -> list[str]:
     """Download MP4 video files. Returns list of failed games."""
     failed: list[str] = []
     for game in games:
-        dest_dir  = _OUTPUT_DIR / game
+        dest_dir  = OUTPUT_DIR / game
         dest_file = dest_dir / f"{game}.mp4"
         dest_dir.mkdir(parents=True, exist_ok=True)
 
@@ -155,12 +181,14 @@ def _print_manual_instructions(failed: list[str]) -> None:
         "\n"
         "2. For each game, download:\n"
         "   - Annotation archive (ball_markup.json + events_markup.json)\n"
+        "   - Segmentation masks (.png files from the annotation ZIP, needed for train-seg)\n"
         "   - Video file (MP4, needed only for TrackNet training)\n"
         "\n"
         "3. Place files so that the layout is:\n"
         "   dataset/openttgames/\n"
         "       game_1/ball_markup.json\n"
         "       game_1/events_markup.json\n"
+        "       game_1/000123.png           ← segmentation mask frame\n"
         "       game_1/game_1.mp4          ← only if training TrackNet\n"
         "       game_2/...\n"
         "       test_1/...\n"
@@ -168,22 +196,24 @@ def _print_manual_instructions(failed: list[str]) -> None:
         "4. Re-run training:\n"
         "   EventNet (no videos needed):  uv run python train_eventnet.py\n"
         "   TrackNet  (videos needed):    uv run python train_tracknet.py\n"
+        "   Unified seg (masks + train videos):  uv run train-seg\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
 
 
 def main() -> None:
     want_video = "--video" in sys.argv
+    want_masks = "--masks" in sys.argv
 
-    _OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    print("=== Downloading annotations ===")
-    failed_ann = download_annotations(_GAMES)
+    print(f"=== Downloading annotations{' + masks' if want_masks else ''} ===")
+    failed_ann = download_annotations(GAMES, include_masks=want_masks)
 
     failed_vid: list[str] = []
     if want_video:
         print("\n=== Downloading videos (training games only, ~50 GB) ===")
-        failed_vid = download_videos(_TRAINING_GAMES)
+        failed_vid = download_videos(TRAINING_GAMES)
 
     failed = failed_ann + failed_vid
     if failed:
@@ -191,20 +221,31 @@ def main() -> None:
         sys.exit(1)
 
     total_ann = sum(
-        1 for g in _GAMES for f in _ANNOTATION_FILES
-        if (_OUTPUT_DIR / g / f).exists()
+        1 for g in GAMES for f in ANNOTATION_FILES
+        if (OUTPUT_DIR / g / f).exists()
+    )
+    total_masks = sum(
+        sum(1 for _ in (OUTPUT_DIR / g).glob(SEGMENT_MASK_GLOB))
+        for g in GAMES
     )
     total_vid = sum(
-        1 for g in _TRAINING_GAMES
-        if (_OUTPUT_DIR / g / f"{g}.mp4").exists()
+        1 for g in TRAINING_GAMES
+        if (OUTPUT_DIR / g / f"{g}.mp4").exists()
     )
-    print(f"\nDone.  {total_ann} annotation files,  {total_vid} videos  →  {_OUTPUT_DIR}")
+    print(f"\nDone.  {total_ann} annotation files,  {total_masks} masks,  {total_vid} videos  →  {OUTPUT_DIR}")
 
-    if not want_video and total_vid < len(_TRAINING_GAMES):
+    if not want_video and total_vid < len(TRAINING_GAMES):
         print(
             "\nNote: videos not downloaded yet.\n"
             "      Run with --video to download them for TrackNet training:\n"
             "      uv run python download_openttgames.py --video"
+        )
+
+    if not want_masks and total_masks == 0:
+        print(
+            "\nNote: segmentation masks not downloaded yet.\n"
+            "      Run with --masks to download them for unified segmentation training:\n"
+            "      uv run python download_openttgames.py --masks"
         )
 
 

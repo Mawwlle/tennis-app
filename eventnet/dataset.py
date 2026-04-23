@@ -1,26 +1,26 @@
-"""EventNet dataset: kinematic feature extraction from ball trajectory."""
+"""EventNet dataset: feature extraction from ball trajectory + net geometry."""
+
+from __future__ import annotations
 
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import torch
-from numpy.typing import NDArray
 from torch import Tensor
 from torch.utils.data import Dataset
 
 from model.schemas import AnnotationStore, BallAnnotationStore
+from eventnet.features import N_FEATURES, NetGeometry, extract_features
+from eventnet.player_detection import PlayerGeometry
 
 
 LABEL_TO_IDX: dict[str, int] = {
-    "hit": 0,
-    "bounce": 1,
-    "net": 2,
-    "none": 3,
+    "bounce": 0,
+    "none": 1,
 }
 IDX_TO_LABEL: dict[int, str] = {v: k for k, v in LABEL_TO_IDX.items()}
-NUM_CLASSES: int = 4
-N_FEATURES: int = 8   # cx, cy, dx, dy, d2x, d2y, speed, angle
+NUM_CLASSES: int = 2
 
 
 @dataclass(frozen=True)
@@ -28,40 +28,8 @@ class EventSample:
     # Normalized (cx, cy) in [0, 1]; None = invisible / not annotated
     positions: tuple[tuple[float, float] | None, ...]
     label_idx: int
-
-
-def extract_kinematics(
-    positions: tuple[tuple[float, float] | None, ...],
-) -> NDArray[np.float32]:
-    """Convert a window of normalized (cx, cy) positions to kinematic features.
-
-    Returns (N, 8) array: [cx, cy, dx, dy, d²x, d²y, speed, angle].
-
-    Missing frames (None) contribute zero velocity / acceleration at that step.
-    Angle is normalised to [-1, 1] via division by π.
-    """
-    n = len(positions)
-    feats = np.zeros((n, N_FEATURES), dtype=np.float32)
-
-    for i, pos in enumerate(positions):
-        if pos is not None:
-            feats[i, 0], feats[i, 1] = pos
-
-    for i in range(1, n):
-        if positions[i] is not None and positions[i - 1] is not None:
-            feats[i, 2] = feats[i, 0] - feats[i - 1, 0]   # dx
-            feats[i, 3] = feats[i, 1] - feats[i - 1, 1]   # dy
-
-    for i in range(2, n):
-        if positions[i] is not None and positions[i - 1] is not None and positions[i - 2] is not None:
-            feats[i, 4] = feats[i, 2] - feats[i - 1, 2]   # d²x
-            feats[i, 5] = feats[i, 3] - feats[i - 1, 3]   # d²y
-
-    dx, dy = feats[:, 2], feats[:, 3]
-    feats[:, 6] = np.sqrt(dx ** 2 + dy ** 2)               # speed
-    feats[:, 7] = np.arctan2(dy, dx) / np.pi               # angle ∈ [-1, 1]
-
-    return feats  # (N, 8)
+    net_geometry: NetGeometry = field(default_factory=NetGeometry)
+    player_geometry: PlayerGeometry = field(default_factory=PlayerGeometry)
 
 
 def _extract_window(
@@ -96,13 +64,23 @@ def build_samples(
     window_size: int,
     frame_width: float,
     frame_height: float,
+    net_geometries: dict[str, NetGeometry] | None = None,
+    player_geometries: dict[str, PlayerGeometry] | None = None,
     neg_ratio: float = 2.0,
     rng_seed: int = 42,
 ) -> list[EventSample]:
-    """Build positive (event) and negative (background) training samples."""
+    """Build positive (event) and negative (background) training samples.
+
+    Args:
+        net_geometries:    Optional mapping from video_id → NetGeometry.
+        player_geometries: Optional mapping from video_id → PlayerGeometry.
+                           Videos without an entry use default geometry.
+    """
     rng = random.Random(rng_seed)
     half = window_size // 2
     samples: list[EventSample] = []
+    geos    = net_geometries    or {}
+    players = player_geometries or {}
 
     for video_id, event_annots in event_store.videos.items():
         ball_annots = ball_store.videos.get(video_id, [])
@@ -117,12 +95,21 @@ def build_samples(
         if not frame_map:
             continue
 
+        geo    = geos.get(video_id, NetGeometry())
+        player = players.get(video_id, PlayerGeometry())
         event_frames = {a.frame_idx for a in event_annots}
 
         for annot in event_annots:
+            if annot.label not in LABEL_TO_IDX:
+                continue
             window = _extract_window(frame_map, annot.frame_idx, half, frame_width, frame_height)
             if window is not None:
-                samples.append(EventSample(positions=tuple(window), label_idx=LABEL_TO_IDX[annot.label]))
+                samples.append(EventSample(
+                    positions=tuple(window),
+                    label_idx=LABEL_TO_IDX[annot.label],
+                    net_geometry=geo,
+                    player_geometry=player,
+                ))
 
         all_frames = sorted(frame_map.keys())
         candidates = [
@@ -136,7 +123,12 @@ def build_samples(
         for frame_idx in chosen:
             window = _extract_window(frame_map, frame_idx, half, frame_width, frame_height)
             if window is not None:
-                samples.append(EventSample(positions=tuple(window), label_idx=LABEL_TO_IDX["none"]))
+                samples.append(EventSample(
+                    positions=tuple(window),
+                    label_idx=LABEL_TO_IDX["none"],
+                    net_geometry=geo,
+                    player_geometry=player,
+                ))
 
     return samples
 
@@ -150,5 +142,5 @@ class KinematicEventDataset(Dataset[tuple[Tensor, int]]):
 
     def __getitem__(self, idx: int) -> tuple[Tensor, int]:
         s = self._samples[idx]
-        feats = extract_kinematics(s.positions)          # (N, 8)
-        return torch.from_numpy(feats.T), s.label_idx    # (8, N) for Conv1d, int
+        feats = extract_features(s.positions, s.net_geometry, s.player_geometry)  # (N, 14)
+        return torch.from_numpy(feats.T), s.label_idx                              # (14, N), int

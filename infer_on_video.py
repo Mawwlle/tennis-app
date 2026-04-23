@@ -1,4 +1,10 @@
-"""Apply TrackNet to a video. Left: ball tracking + trail. Right: heatmap."""
+"""Full pipeline: TrackNet → interpolation → net segmentation → EventNet.
+
+Pass 0: YOLO-seg on first 30 frames → average net geometry
+Pass 1: TrackNet every INFER_STEP frames → spline interpolation of ball positions
+Pass 2: EventNet on sliding 15-frame window → game state per frame
+Pass 3: Render side-by-side MP4
+"""
 
 from pathlib import Path
 
@@ -10,43 +16,51 @@ from numpy.typing import NDArray
 from scipy.interpolate import make_interp_spline
 from tqdm import tqdm
 
-from eventnet.dataset import IDX_TO_LABEL, extract_kinematics
+from eventnet.dataset import IDX_TO_LABEL
+from eventnet.features import NetGeometry, extract_features
 from eventnet.model import TCNEventNet, TCNEventNetConfig
+from eventnet.player_detection import PlayerGeometry, compute_player_geometry
+from eventnet.segmentation import compute_net_geometry, load_net_model
 from tracknet.model import TrackNet
 
 VIDEO_PATH       = Path("test_2.mp4")
 WEIGHTS          = Path("weights/tracknet_best.pt")
 EVENTNET_WEIGHTS = Path("weights/eventnet_best.pt")
+NET_SEG_WEIGHTS  = Path("weights/seg_best.pt")
 OUTPUT           = Path("infer_result_new.mp4")
 
 TARGET_W       = 640
 TARGET_H       = 360
-CONF_THRESHOLD = 0.95
+CONF_THRESHOLD = 0.99
 TRAIL_WINDOW   = 9
-INFER_STEP     = 3   # run TrackNet every N frames; gaps filled by interpolation
+INFER_STEP     = 3
+SEG_FRAMES     = 30   # frames used to estimate net geometry
 
 
 _EVENT_COLORS: dict[str, tuple[int, int, int]] = {
-    "hit":    (0,   215, 255),   # gold
-    "bounce": (255, 220, 0),     # cyan
-    "net":    (0,   60,  220),   # red
-    "none":   (120, 120, 120),   # gray
+    "hit":    (0,   215, 255),
+    "bounce": (255, 220, 0),
+    "net":    (0,   60,  220),
+    "none":   (120, 120, 120),
 }
 
 
-def load_model(weights: Path, device: torch.device) -> TrackNet:
+# ---------------------------------------------------------------------------
+# Model loading
+# ---------------------------------------------------------------------------
+
+
+def load_tracknet(weights: Path, device: torch.device) -> TrackNet:
     model = TrackNet()
     model.load_state_dict(torch.load(str(weights), map_location=device, weights_only=True))
-    model.to(device)
-    model.eval()
+    model.to(device).eval()
     return model
 
 
-def load_event_model(
+def load_eventnet(
     weights: Path,
     device: torch.device,
 ) -> tuple[TCNEventNet, TCNEventNetConfig] | None:
-    """Load TCNEventNet from checkpoint. Returns None if weights don't exist yet."""
     if not weights.exists():
         return None
     checkpoint: dict[str, object] = torch.load(str(weights), map_location=device, weights_only=True)
@@ -57,46 +71,35 @@ def load_event_model(
     return model, cfg
 
 
-def classify_events(
-    model: TCNEventNet,
-    cfg: TCNEventNetConfig,
-    all_positions: dict[int, tuple[float, float]],
-    device: torch.device,
-) -> dict[int, tuple[str, float]]:
-    """Classify game events for every frame using a sliding window of kinematic features.
+# ---------------------------------------------------------------------------
+# Pass 0: net geometry via YOLO segmentation
+# ---------------------------------------------------------------------------
 
-    Positions from TrackNet are in (TARGET_W × TARGET_H) space and are
-    normalised to [0, 1] to match what was used during training.
-    """
-    half = cfg.window_size // 2
-    all_frames = sorted(all_positions)
-    results: dict[int, tuple[str, float]] = {}
 
-    for center in all_frames:
-        positions: tuple[tuple[float, float] | None, ...] = tuple(
-            (all_positions[idx][0] / TARGET_W, all_positions[idx][1] / TARGET_H)
-            if idx in all_positions else None
-            for idx in range(center - half, center + half + 1)
+def estimate_net_geometry(video_path: Path) -> NetGeometry:
+    """Segment first SEG_FRAMES frames with YOLO-seg and return mean net geometry."""
+    if not NET_SEG_WEIGHTS.exists():
+        print("Net seg weights not found — using default geometry")
+        return NetGeometry()
+
+    try:
+        net_model = load_net_model(NET_SEG_WEIGHTS)
+        print(f"Estimating net geometry from first {SEG_FRAMES} frames…")
+        return compute_net_geometry(
+            video_path=video_path,
+            net_model=net_model,
+            n_frames=SEG_FRAMES,
+            target_w=TARGET_W,
+            target_h=TARGET_H,
         )
-        feats = extract_kinematics(positions)                    # (N, 8)
-        tensor = torch.from_numpy(feats.T).unsqueeze(0).to(device)  # (1, 8, N)
-        with torch.no_grad():
-            probs = F.softmax(model(tensor), dim=1)[0]
-        label_idx = int(probs.argmax().item())
-        results[center] = (IDX_TO_LABEL[label_idx], float(probs[label_idx].item()))
-
-    return results
+    except Exception as exc:
+        print(f"  [seg] Failed ({exc}) — using default geometry")
+        return NetGeometry()
 
 
-def _draw_event_label(
-    frame: NDArray[np.uint8],
-    label: str,
-    confidence: float,
-) -> None:
-    color = _EVENT_COLORS[label]
-    text = f"{label}  {confidence:.0%}"
-    cv2.putText(frame, text, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4, cv2.LINE_AA)
-    cv2.putText(frame, text, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color,   2, cv2.LINE_AA)
+# ---------------------------------------------------------------------------
+# Pass 1: TrackNet detection + interpolation
+# ---------------------------------------------------------------------------
 
 
 def predict(
@@ -104,7 +107,6 @@ def predict(
     frames: list[NDArray[np.float32]],
     device: torch.device,
 ) -> tuple[float, float, float, NDArray[np.float32]]:
-    """Returns (cx, cy, confidence, heatmap_np). cx=-1 if below threshold."""
     stacked = np.concatenate([f.transpose(2, 0, 1) for f in frames], axis=0)
     tensor = torch.from_numpy(stacked).unsqueeze(0).to(device)
 
@@ -123,7 +125,7 @@ def predict(
     return float(cx), float(cy), confidence, heatmap_np
 
 
-def _interpolate(
+def interpolate_positions(
     detections: dict[int, tuple[float, float]],
 ) -> dict[int, tuple[float, float]]:
     if len(detections) < 2:
@@ -139,6 +141,58 @@ def _interpolate(
 
     first, last = known_idx[0], known_idx[-1]
     return {i: (float(spl_x(i)), float(spl_y(i))) for i in range(first, last + 1)}
+
+
+# ---------------------------------------------------------------------------
+# Pass 2: EventNet classification
+# ---------------------------------------------------------------------------
+
+
+def classify_events(
+    model: TCNEventNet,
+    cfg: TCNEventNetConfig,
+    all_positions: dict[int, tuple[float, float]],
+    net_geometry: NetGeometry,
+    device: torch.device,
+    player_geometry: PlayerGeometry | None = None,
+) -> dict[int, tuple[str, float]]:
+    """Classify game events using a sliding window of kinematic + geometry features."""
+    half = cfg.window_size // 2
+    all_frames = sorted(all_positions)
+    results: dict[int, tuple[str, float]] = {}
+
+    for center in all_frames:
+        positions: tuple[tuple[float, float] | None, ...] = tuple(
+            (all_positions[idx][0] / TARGET_W, all_positions[idx][1] / TARGET_H)
+            if idx in all_positions else None
+            for idx in range(center - half, center + half + 1)
+        )
+        feats = extract_features(positions, net_geometry, player_geometry)  # (N, 14)
+        tensor = torch.from_numpy(feats.T).unsqueeze(0).to(device)          # (1, 14, N)
+
+        with torch.no_grad():
+            probs = F.softmax(model(tensor), dim=1)[0]
+
+        label_idx = int(probs.argmax().item())
+        results[center] = (IDX_TO_LABEL[label_idx], float(probs[label_idx].item()))
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Pass 3: rendering
+# ---------------------------------------------------------------------------
+
+
+def _draw_event_label(
+    frame: NDArray[np.uint8],
+    label: str,
+    confidence: float,
+) -> None:
+    color = _EVENT_COLORS[label]
+    text = f"{label}  {confidence:.0%}"
+    cv2.putText(frame, text, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4, cv2.LINE_AA)
+    cv2.putText(frame, text, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
 
 
 def _draw_spline_trail(
@@ -182,9 +236,21 @@ def _draw_ball(
         cv2.circle(frame, (x, y), 6, (0, 0, 0), 1, cv2.LINE_AA)
 
 
-def _to_heatmap(heatmap_np: NDArray[np.float32]) -> NDArray[np.uint8]:
+def _to_heatmap(heatmap_np: NDArray[np.float32]) -> np.ndarray:
     hm_u8 = (heatmap_np * 255).astype(np.uint8)
-    return cv2.applyColorMap(hm_u8, cv2.COLORMAP_INFERNO)
+    return cv2.applyColorMap(hm_u8, cv2.COLORMAP_INFERNO)  # type: ignore[return-value]
+
+
+def _draw_net_line(frame: NDArray[np.uint8], geo: NetGeometry) -> None:
+    """Draw the estimated net position as a vertical line."""
+    x = int(geo.cx * TARGET_W)
+    y = int(geo.top_y * TARGET_H)
+    cv2.line(frame, (x, y), (x, TARGET_H), (200, 200, 200), 1, cv2.LINE_AA)
+
+
+# ---------------------------------------------------------------------------
+# Main pipeline
+# ---------------------------------------------------------------------------
 
 
 def run(weights: Path, video_path: Path, output: Path) -> None:
@@ -194,9 +260,10 @@ def run(weights: Path, video_path: Path, output: Path) -> None:
         "cpu"
     )
     print(f"Device: {device}")
-    model = load_model(weights, device)
 
-    event_loaded = load_event_model(EVENTNET_WEIGHTS, device)
+    tracknet = load_tracknet(weights, device)
+
+    event_loaded = load_eventnet(EVENTNET_WEIGHTS, device)
     if event_loaded is None:
         print("EventNet weights not found — skipping event classification")
     else:
@@ -207,8 +274,19 @@ def run(weights: Path, video_path: Path, output: Path) -> None:
     fps   = cap.get(cv2.CAP_PROP_FPS)
     cap.release()
 
-    # ── Pass 1: detect ────────────────────────────────────────────────────────
-    print(f"Pass 1 — running TrackNet on {total} frames…")
+    # ── Pass 0: net geometry + player positions ───────────────────────────────
+    net_geometry = estimate_net_geometry(video_path)
+
+    player_geometry: PlayerGeometry | None = None
+    if event_loaded is not None:
+        try:
+            player_geometry = compute_player_geometry(video_path, n_frames=60)
+            print(f"Players: left=({player_geometry.left_cx:.2f},{player_geometry.left_cy:.2f})  right=({player_geometry.right_cx:.2f},{player_geometry.right_cy:.2f})")
+        except Exception as exc:
+            print(f"Player detection failed ({exc}) — using defaults")
+
+    # ── Pass 1: detect + interpolate ──────────────────────────────────────────
+    print(f"Pass 1 — TrackNet on {total} frames…")
     detections: dict[int, tuple[float, float]] = {}
     frame_buffer: list[NDArray[np.float32]] = []
 
@@ -226,26 +304,31 @@ def run(weights: Path, video_path: Path, output: Path) -> None:
             frame_buffer.insert(0, frame_buffer[0])
 
         if frame_idx % INFER_STEP == 0:
-            cx, cy, _, _ = predict(model, frame_buffer[-3:], device)
+            cx, cy, _, _ = predict(tracknet, frame_buffer[-3:], device)
             if cx >= 0:
                 detections[frame_idx] = (cx, cy)
     cap.release()
 
     print(f"  detected {len(detections)}/{total} frames")
-    all_positions = _interpolate(detections)
-    print(f"  after interpolation: {len(all_positions)} frames have a position")
+    all_positions = interpolate_positions(detections)
+    print(f"  after interpolation: {len(all_positions)} frames")
 
-    # ── Event classification ───────────────────────────────────────────────────
+    # ── Pass 2: event classification ──────────────────────────────────────────
     event_labels: dict[int, tuple[str, float]] = {}
     if event_loaded is not None:
-        print("Classifying events…")
+        print("Pass 2 — EventNet classification…")
         event_model, event_cfg = event_loaded
         event_labels = classify_events(
-            event_model, event_cfg, all_positions, device
+            model=event_model,
+            cfg=event_cfg,
+            all_positions=all_positions,
+            net_geometry=net_geometry,
+            device=device,
+            player_geometry=player_geometry,
         )
 
-    # ── Pass 2: render ────────────────────────────────────────────────────────
-    print("Pass 2 — rendering…")
+    # ── Pass 3: render ────────────────────────────────────────────────────────
+    print("Pass 3 — rendering…")
     writer = cv2.VideoWriter(
         str(output),
         cv2.VideoWriter.fourcc(*"mp4v"),
@@ -271,11 +354,9 @@ def run(weights: Path, video_path: Path, output: Path) -> None:
             frame_buffer.insert(0, frame_buffer[0])
 
         if frame_idx % INFER_STEP == 0:
-            _, _, _, heatmap = predict(model, frame_buffer[-3:], device)
-        # else: reuse previous heatmap
+            _, _, _, heatmap = predict(tracknet, frame_buffer[-3:], device)
 
-        # Left: tracking on resized frame
-        left = cv2.resize(raw, (TARGET_W, TARGET_H))
+        left: np.ndarray = cv2.resize(raw, (TARGET_W, TARGET_H))
 
         trail_keys = [i for i in known_frames if i <= frame_idx][-TRAIL_WINDOW:]
         trail = [detections[i] for i in trail_keys]
@@ -292,12 +373,11 @@ def run(weights: Path, video_path: Path, output: Path) -> None:
             label, conf = event_labels[frame_idx]
             _draw_event_label(left, label, conf)
 
-        # Right: heatmap
-        right = _to_heatmap(heatmap)
+        _draw_net_line(left, net_geometry)
 
+        right = _to_heatmap(heatmap)
         combined = np.hstack([left, right])
         cv2.line(combined, (TARGET_W, 0), (TARGET_W, TARGET_H - 1), (60, 60, 60), 2)
-
         writer.write(combined)
 
     cap.release()
