@@ -7,7 +7,7 @@ Pipeline:
   4. Save best weights and a metrics graph into weights/
 
 OpenTTGames mask encoding (channel-wise):
-    B = table, G = person, R = scoreboard (ignored)
+    R = table, G = person, B = scoreboard (ignored)
 """
 
 from __future__ import annotations
@@ -100,14 +100,23 @@ def _mask_to_yolo_lines(mask: np.ndarray, class_id: int) -> list[str]:
 
 
 def _read_mask(mask_path: Path) -> tuple[np.ndarray, np.ndarray]:
-    """Return (table_mask, person_mask) from OpenTTGames PNG."""
+    """Return (table_mask, person_mask) from OpenTTGames PNG.
+
+    OpenTTGames mask encoding (RGB in file):
+      R channel → table   (visually red)
+      G channel → person  (visually green)
+
+    cv2.imread converts RGB→BGR, so:
+      table  = bgr[:, :, 2]  (R in RGB = index 2 in BGR)
+      person = bgr[:, :, 1]  (G in RGB = index 1 in BGR)
+    """
     mask = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED)
     if mask is None:
         raise RuntimeError(f"Failed to read mask: {mask_path}")
 
     if mask.ndim == 3:
         bgr = mask[:, :, :3]
-        return (bgr[:, :, 0] > 0).astype(np.uint8), (bgr[:, :, 1] > 0).astype(np.uint8)
+        return (bgr[:, :, 2] > 0).astype(np.uint8), (bgr[:, :, 1] > 0).astype(np.uint8)
 
     return (mask == 1).astype(np.uint8), (mask == 2).astype(np.uint8)
 
@@ -125,31 +134,38 @@ def _build_game_samples(
     if not mask_paths:
         raise RuntimeError(f"No segmentation masks in {game_dir}")
 
+    # Build a {frame_idx: mask_path} lookup so we can read the video sequentially
+    # instead of seeking to each frame individually (seek in compressed video is slow).
+    mask_by_frame: dict[int, Path] = {int(p.stem): p for p in mask_paths}
+    target_frames = sorted(mask_by_frame)
+
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {video_path}")
 
     written = 0
-    for mask_path in mask_paths:
-        frame_idx = int(mask_path.stem)
-        table_mask, person_mask = _read_mask(mask_path)
+    cur_frame = 0
+    target_iter = iter(target_frames)
+    next_target = next(target_iter, None)
 
-        lines = [
-            *_mask_to_yolo_lines(table_mask, TABLE_ID),
-            *_mask_to_yolo_lines(person_mask, PERSON_ID),
-        ]
-        if not lines:
-            continue
-
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+    while next_target is not None:
         ret, frame = cap.read()
-        if not ret or frame is None:
-            continue
-
-        stem = f"{game_dir.name}_{frame_idx:06d}"
-        cv2.imwrite(str(images_dir / f"{stem}.jpg"), frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
-        _write_label_file(labels_dir / f"{stem}.txt", lines)
-        written += 1
+        if not ret:
+            break
+        if cur_frame == next_target:
+            mask_path = mask_by_frame[cur_frame]
+            table_mask, person_mask = _read_mask(mask_path)
+            lines = [
+                *_mask_to_yolo_lines(table_mask, TABLE_ID),
+                *_mask_to_yolo_lines(person_mask, PERSON_ID),
+            ]
+            if lines:
+                stem = f"{game_dir.name}_{cur_frame:06d}"
+                cv2.imwrite(str(images_dir / f"{stem}.jpg"), frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                _write_label_file(labels_dir / f"{stem}.txt", lines)
+                written += 1
+            next_target = next(target_iter, None)
+        cur_frame += 1
 
     cap.release()
     return written
@@ -193,7 +209,12 @@ def _write_yaml(dataset_dir: Path) -> Path:
     return yaml_path
 
 
-def build_dataset(dataset_dir: Path, val_ratio: float, seed: int) -> Path:
+def build_dataset(dataset_dir: Path, val_ratio: float, seed: int, force: bool = False) -> Path:
+    yaml_path = dataset_dir / "dataset.yaml"
+    if not force and yaml_path.exists() and (dataset_dir / "images" / "train").exists():
+        print(f"Dataset already exists at {dataset_dir} — skipping build (use --rebuild to force)")
+        return yaml_path
+
     _reset_dir(dataset_dir)
     images_dir = dataset_dir / "_all" / "images"
     labels_dir = dataset_dir / "_all" / "labels"
@@ -276,13 +297,16 @@ def train(config: SegConfig) -> Path:
 
 
 def entrypoint() -> None:
+    import sys
+    rebuild = "--rebuild" in sys.argv
+
     print("=== Downloading OpenTTGames videos + masks ===")
     failed = download_annotations(TRAINING_GAMES, include_masks=True) + download_videos(TRAINING_GAMES)
     if failed:
         raise RuntimeError(f"Download failed: {', '.join(failed)}")
 
     print("\n=== Building YOLO dataset ===")
-    yaml_path = build_dataset(DATASET_DIR, val_ratio=VAL_RATIO, seed=SEED)
+    yaml_path = build_dataset(DATASET_DIR, val_ratio=VAL_RATIO, seed=SEED, force=rebuild)
 
     config = SegConfig(
         dataset_yaml=yaml_path,

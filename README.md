@@ -203,7 +203,7 @@ ML-пайплайн для трекинга мяча, детекции собы�
            игроки движутся → обновляем player masks
 
   Веса: weights/seg_best.pt
-  Данные для обучения: OpenTTGames dataset (PNG masks, B=table, G=person)
+  Данные для обучения: OpenTTGames dataset (PNG masks, R=table, G=person)
 ```
 
 ---

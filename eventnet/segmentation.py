@@ -1,4 +1,8 @@
-"""Compute stable table/net masks and net geometry from YOLO-seg detections."""
+"""Compute stable table/person masks and net geometry from YOLO-seg detections.
+
+New model classes: table=0, person=1.
+Net geometry is derived analytically from the table mask centerline.
+"""
 
 from __future__ import annotations
 
@@ -29,8 +33,8 @@ def load_net_model(weights: Path) -> "YOLO":
 class SegmentationMaps:
     """Averaged masks from the first N frames of the segmentation model."""
 
-    net_mask: np.ndarray | None
     table_mask: np.ndarray | None
+    person_mask: np.ndarray | None
     net_geometry: NetGeometry
 
 
@@ -49,6 +53,19 @@ def _label_from_result(result: object, det_idx: int) -> str:
     return str(cls_idx)
 
 
+def _net_geometry_from_table(table_mask: np.ndarray, target_w: int, target_h: int) -> NetGeometry:
+    """Derive net geometry from the table mask centerline (vertical midpoint)."""
+    _, xs = np.where(table_mask > 0)
+    if len(xs) == 0:
+        return NetGeometry()
+    x_min, x_max = int(xs.min()), int(xs.max())
+    cx_px = (x_min + x_max) // 2
+    col = table_mask[:, cx_px]
+    col_ys = np.where(col > 0)[0]
+    top_y = int(col_ys.min()) if len(col_ys) > 0 else 0
+    return NetGeometry(cx=cx_px / target_w, top_y=top_y / target_h)
+
+
 def compute_segmentation_maps(
     video_path: Path,
     net_model: "YOLO",
@@ -58,13 +75,17 @@ def compute_segmentation_maps(
     conf: float = 0.25,
     mask_threshold: float = 0.35,
 ) -> SegmentationMaps:
-    """Run YOLO-seg on the first frames and return averaged table/net masks."""
+    """Run YOLO-seg on the first N frames and return averaged table/person masks.
+
+    New model classes: table=0, person=1.
+    Net geometry is derived analytically from the table mask centerline.
+    """
     cap = cv2.VideoCapture(str(video_path))
 
-    net_acc = np.zeros((target_h, target_w), dtype=np.float32)
-    table_acc = np.zeros((target_h, target_w), dtype=np.float32)
-    net_hits = 0
-    table_hits = 0
+    table_acc  = np.zeros((target_h, target_w), dtype=np.float32)
+    person_acc = np.zeros((target_h, target_w), dtype=np.float32)
+    table_hits  = 0
+    person_hits = 0
     frame_idx = 0
 
     while frame_idx < n_frames:
@@ -79,46 +100,39 @@ def compute_segmentation_maps(
         if masks is not None:
             for det_idx, mask_tensor in enumerate(masks.data):
                 mask_np = mask_tensor.cpu().numpy()
-                resized = cv2.resize(mask_np, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-                binary = (resized > 0.5).astype(np.float32)
+                mask_resized = cv2.resize(mask_np, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+                binary = (mask_resized > 0.5).astype(np.float32)
                 label = _label_from_result(result, det_idx)
 
-                if label in {"0", "net"}:
-                    net_acc += binary
-                    net_hits += 1
-                elif label in {"1", "table"}:
+                if label in {"0", "table"}:
                     table_acc += binary
                     table_hits += 1
+                elif label in {"1", "person"}:
+                    person_acc += binary
+                    person_hits += 1
 
         frame_idx += 1
 
     cap.release()
 
-    net_mask = None
-    table_mask = None
-    geometry = NetGeometry()
-
-    if net_hits > 0:
-        net_mask = (net_acc / net_hits >= mask_threshold).astype(np.uint8)
-        ys, xs = np.where(net_mask > 0)
-        if len(xs) > 0:
-            geometry = NetGeometry(
-                cx=float(xs.mean()) / target_w,
-                top_y=float(ys.min()) / target_h,
-            )
-        print(f"  [seg] Net mask from {net_hits} detections")
-    else:
-        print("  [seg] No net detections in first frames — using default geometry")
+    table_mask  = None
+    person_mask = None
+    geometry    = NetGeometry()
 
     if table_hits > 0:
         table_mask = (table_acc / table_hits >= mask_threshold).astype(np.uint8)
+        geometry = _net_geometry_from_table(table_mask, target_w, target_h)
         print(f"  [seg] Table mask from {table_hits} detections")
     else:
-        print("  [seg] No table detections in first frames")
+        print("  [seg] No table detections in first frames — using default geometry")
+
+    if person_hits > 0:
+        person_mask = (person_acc / person_hits >= mask_threshold).astype(np.uint8)
+        print(f"  [seg] Person mask from {person_hits} detections")
 
     return SegmentationMaps(
-        net_mask=net_mask,
         table_mask=table_mask,
+        person_mask=person_mask,
         net_geometry=geometry,
     )
 

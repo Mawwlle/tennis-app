@@ -1,4 +1,4 @@
-"""Segment tennis video: net + table via YOLO-seg.
+"""Segment tennis video: table + person via YOLO-seg.
 
 Output: side-by-side MP4 — left: original + coloured overlay,
         right: binary mask canvas.
@@ -17,7 +17,7 @@ from tqdm import tqdm
 from ultralytics import YOLO  # type: ignore[reportPrivateImportUsage]
 
 VIDEO_PATH = Path("test_7.mp4")
-NET_WEIGHTS = Path("yolo_seg.pt")
+NET_WEIGHTS = Path("weights/seg_best.pt")
 OUTPUT = Path("seg_result.mp4")
 
 TARGET_W = 640
@@ -25,15 +25,9 @@ TARGET_H = 360
 NET_CONF = 0.25
 
 # BGR colours
-COLOR_NET:   tuple[int, int, int] = (0, 255, 0)    # green
-COLOR_TABLE: tuple[int, int, int] = (0, 128, 255)  # orange-blue
+COLOR_PERSON: tuple[int, int, int] = (0, 255, 0)    # green
+COLOR_TABLE:  tuple[int, int, int] = (0, 128, 255)  # orange
 OVERLAY_ALPHA = 0.40
-
-
-# ---------------------------------------------------------------------------
-# Segmentation — YOLO
-# ---------------------------------------------------------------------------
-
 
 def load_net_model(weights: Path) -> YOLO:
     return YOLO(str(weights))
@@ -58,13 +52,16 @@ def predict_masks(
     model: YOLO,
     frame_bgr: np.ndarray,
 ) -> tuple[list[np.ndarray], list[np.ndarray]]:
-    """Returns (net_masks, table_masks) as uint8 arrays."""
+    """Returns (person_masks, table_masks) as uint8 arrays.
+
+    New model classes: table=0, person=1.
+    """
     result = model(frame_bgr, conf=NET_CONF, verbose=False)[0]
-    net_masks: list[np.ndarray] = []
+    person_masks: list[np.ndarray] = []
     table_masks: list[np.ndarray] = []
 
     if result.masks is None:
-        return net_masks, table_masks
+        return person_masks, table_masks
 
     h, w = frame_bgr.shape[:2]
     for det_idx, mask_tensor in enumerate(result.masks.data):
@@ -72,12 +69,12 @@ def predict_masks(
         resized = cv2.resize(mask_np, (w, h), interpolation=cv2.INTER_LINEAR)
         binary = (resized > 0.5).astype(np.uint8)
         label = _label_from_result(result, det_idx)
-        if label in {"0", "net"}:
-            net_masks.append(binary)
-        elif label in {"1", "table"}:
+        if label in {"0", "table"}:
             table_masks.append(binary)
+        elif label in {"1", "person"}:
+            person_masks.append(binary)
 
-    return net_masks, table_masks
+    return person_masks, table_masks
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +84,7 @@ def predict_masks(
 
 def draw_overlay(
     frame: np.ndarray,
-    net_masks: list[np.ndarray],
+    person_masks: list[np.ndarray],
     table_masks: list[np.ndarray],
 ) -> tuple[np.ndarray, np.ndarray]:
     """Returns (overlay_frame, mask_canvas)."""
@@ -95,26 +92,24 @@ def draw_overlay(
     blend = out.copy()
     canvas = np.zeros_like(frame)
 
-    # Table
     for table_mask in table_masks:
         blend[table_mask == 1] = COLOR_TABLE
         canvas[table_mask == 1] = COLOR_TABLE
-        contours_t, _ = cv2.findContours(table_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(out, contours_t, -1, COLOR_TABLE, 2)
+        contours, _ = cv2.findContours(table_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(out, contours, -1, COLOR_TABLE, 2)
 
-    # Net
-    for net_mask in net_masks:
-        blend[net_mask == 1] = COLOR_NET
-        canvas[net_mask == 1] = COLOR_NET
-        contours_n, _ = cv2.findContours(net_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(out, contours_n, -1, COLOR_NET, 2)
+    for person_mask in person_masks:
+        blend[person_mask == 1] = COLOR_PERSON
+        canvas[person_mask == 1] = COLOR_PERSON
+        contours, _ = cv2.findContours(person_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(out, contours, -1, COLOR_PERSON, 2)
 
     cv2.addWeighted(blend, OVERLAY_ALPHA, out, 1 - OVERLAY_ALPHA, 0, out)
     return out, canvas
 
 
 def draw_legend(frame: np.ndarray) -> None:
-    for i, (label, color) in enumerate([("net", COLOR_NET), ("table", COLOR_TABLE)]):
+    for i, (label, color) in enumerate([("table", COLOR_TABLE), ("person", COLOR_PERSON)]):
         x, y = 10, 24 + i * 24
         cv2.rectangle(frame, (x, y - 14), (x + 16, y), color, -1)
         cv2.putText(frame, label, (x + 22, y - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)

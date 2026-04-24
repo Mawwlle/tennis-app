@@ -353,15 +353,13 @@ def _run_calibration(video_path: Path) -> CalibrationData:
         )
         table_mask = cv2.dilate(seg_maps.table_mask, kernel, iterations=1)
 
-        net_mask = seg_maps.net_mask
         net_geometry = seg_maps.net_geometry
 
+        net_mask = _build_net_mask_from_table(table_mask)
         if net_mask is None:
-            net_mask = _build_net_mask_from_table(table_mask)
-            if net_mask is None:
-                raise RuntimeError("calibration failed: net not found")
-            net_geometry = _net_geometry_from_mask(net_mask)
-            print("  [calibration] Net derived from table geometry")
+            raise RuntimeError("calibration failed: net not found")
+        net_geometry = _net_geometry_from_mask(net_mask)
+        print("  [calibration] Net derived from table geometry")
 
         return CalibrationData(
             net_mask=net_mask,
