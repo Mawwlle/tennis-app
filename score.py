@@ -1,13 +1,14 @@
-"""Score solver: trajectory-only event spotting and scoring.
+"""Streaming score solver: single-pass detection + EventNet + trajectory scoring.
 
-This pipeline does not use EventNet. All events are inferred from the ball
-trajectory produced by TrackNet:
+Pipeline:
+  Pass 1  TrackNet (every INFER_STEP) + spline interpolation
+          + EventNet causal window -> ball positions + bounce events
+          + trajectory heuristics -> hit / net / miss events
+          + rally state machine   -> score timeline
+  Pass 2  Render annotated MP4 with score overlay + audio
 
-  Pass 0  YOLO-seg (optional)  -> net geometry
-  Pass 1  TrackNet + spline    -> ball positions
-  Pass 2  trajectory heuristics -> hit / bounce / net events
-  Pass 3  rally state machine  -> score timeline
-  Pass 4  render annotated MP4
+Net geometry is fixed via NET_CX_RATIO — no segmentation required.
+Set NET_CX_RATIO to the net's horizontal centre as a fraction of frame width.
 
 Usage:
     uv run python score.py
@@ -15,15 +16,12 @@ Usage:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from pathlib import Path
 import subprocess
 import tempfile
-from typing import TYPE_CHECKING, Literal
-
-if TYPE_CHECKING:
-    from ultralytics import YOLO
 import wave
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING, Literal
 
 import cv2
 import numpy as np
@@ -34,26 +32,31 @@ from scipy.interpolate import make_interp_spline
 from scipy.signal import savgol_filter
 from tqdm import tqdm
 
-from eventnet.features import NetGeometry
-from eventnet.segmentation import compute_segmentation_maps, load_net_model
 from tracknet.model import TrackNet
 
-VIDEO_PATH        = Path("dataset/videos/normal_point/Screen Recording 2026-02-23 at 16.02.35.mov")
-TRACKNET_WEIGHTS  = Path("weights/tracknet_best.pt")
-SEG_WEIGHTS       = Path("weights/seg_best.pt")     # unified table+person model
-EVENTNET_WEIGHTS  = Path("weights/eventnet_best.pt")
-OUTPUT            = Path("score_result.mp4")
+if TYPE_CHECKING:
+    from eventnet.model import HeatmapEventNet
+    from ultralytics import YOLO
 
-EVENTNET_THRESHOLD = 0.50   # sigmoid threshold for EventNet peak detection
-EVENTNET_DEDUP     = 8      # min frames between EventNet events
+VIDEO_PATH       = Path("test_3.mp4")
+TRACKNET_WEIGHTS = Path("weights/tracknet_best.pt")
+EVENTNET_WEIGHTS = Path("weights/eventnet_best.pt")
+SEG_WEIGHTS      = Path("weights/seg_best.pt")
+OUTPUT           = Path("score_result.mp4")
+
+NET_CX_RATIO = 0.50   # net centre as fraction of frame width
 
 TARGET_W = 640
 TARGET_H = 360
 CONF_THRESHOLD = 0.99
 TRAIL_WINDOW   = 18
 INFER_STEP     = 4
-SEG_FRAMES     = 1
-SEG_INTERVAL   = 100   # re-run segmentation every N frames (players move)
+
+# EventNet causal window
+EN_WINDOW = 15
+EN_HALF   = EN_WINDOW // 2
+EVENTNET_THRESHOLD = 0.35
+EVENTNET_DEDUP     = 8
 
 # Trajectory smoothing
 TRAJ_SMOOTH_WINDOW = 6
@@ -87,7 +90,6 @@ EVENT_TEXT_FADE_FRAMES  = 26
 MISS_MAX_Y_RATIO        = 0.88
 MISS_OUT_X_MARGIN_RATIO = 0.03
 MISS_RETURN_X_SPEED     = 0.75
-TABLE_MASK_MARGIN_PX    = 10
 
 
 Side = Literal["left", "right"]
@@ -156,13 +158,6 @@ class TrajectorySeries:
 
 
 @dataclass
-class CalibrationData:
-    net_mask: np.ndarray
-    table_mask: np.ndarray
-    net_geometry: NetGeometry
-
-
-@dataclass
 class RallyStateMachine:
     """Finite-state scoring from trajectory events."""
 
@@ -189,7 +184,6 @@ class RallyStateMachine:
             return None
 
         if self.phase == "await_bounce" and hit.side == self.striker:
-            # Duplicate hit candidate near the same contact point.
             if hit.frame_idx - self.last_event_frame <= HIT_DEDUP_FRAMES:
                 self.last_event_frame = hit.frame_idx
                 return None
@@ -281,10 +275,82 @@ def _other_side(side: Side) -> Side:
     return "right" if side == "left" else "left"
 
 
+_COLOR_TABLE:  tuple[int, int, int] = (0, 128, 255)   # orange
+_COLOR_PERSON: tuple[int, int, int] = (0, 220, 80)    # green
+
+
+def _load_seg_model(weights: Path) -> "YOLO":
+    from ultralytics import YOLO  # type: ignore[reportMissingImports]
+    return YOLO(str(weights))
+
+
+def _predict_seg_masks(
+    model: "YOLO",
+    frame_bgr: np.ndarray,
+    conf: float = 0.25,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Return (table_mask, person_mask) as uint8 arrays the same size as frame_bgr."""
+    h, w = frame_bgr.shape[:2]
+    result = model(frame_bgr, conf=conf, verbose=False)[0]
+    if result.masks is None:
+        return None, None
+
+    names = getattr(result, "names", {}) or {}
+    boxes = getattr(result, "boxes", None)
+    table_mask = np.zeros((h, w), dtype=np.uint8)
+    person_mask = np.zeros((h, w), dtype=np.uint8)
+
+    for det_idx, mask_tensor in enumerate(result.masks.data):
+        cls_idx = int(boxes.cls[det_idx].item()) if boxes is not None else -1
+        label = str(names.get(cls_idx, cls_idx)).lower() if isinstance(names, dict) else str(cls_idx)
+
+        mask_np = mask_tensor.cpu().numpy()
+        resized = cv2.resize(mask_np, (w, h), interpolation=cv2.INTER_LINEAR)
+        binary = (resized > 0.5).astype(np.uint8)
+
+        if label in {"0", "table"}:
+            table_mask = cv2.bitwise_or(table_mask, binary)
+        elif label in {"1", "person"}:
+            person_mask = cv2.bitwise_or(person_mask, binary)
+
+    table_out = table_mask if table_mask.any() else None
+    person_out = person_mask if person_mask.any() else None
+    return table_out, person_out
+
+
+def _draw_table_mask(frame: np.ndarray, mask: np.ndarray) -> None:
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    overlay = frame.copy()
+    overlay[mask > 0] = _COLOR_TABLE
+    cv2.addWeighted(overlay, 0.12, frame, 0.88, 0, frame)
+    cv2.drawContours(frame, contours, -1, _COLOR_TABLE, 1, cv2.LINE_AA)
+
+
+def _draw_person_mask(frame: np.ndarray, mask: np.ndarray) -> None:
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    overlay = frame.copy()
+    overlay[mask > 0] = _COLOR_PERSON
+    cv2.addWeighted(overlay, 0.20, frame, 0.80, 0, frame)
+    cv2.drawContours(frame, contours, -1, _COLOR_PERSON, 1, cv2.LINE_AA)
+
+
 def _load_tracknet(weights: Path, device: torch.device) -> TrackNet:
     model = TrackNet()
     model.load_state_dict(torch.load(str(weights), map_location=device, weights_only=True))
     return model.to(device).eval()
+
+
+def _load_eventnet(
+    weights: Path,
+    device: torch.device,
+) -> "HeatmapEventNet":
+    from eventnet.model import HeatmapEventNet, HeatmapEventNetConfig
+
+    checkpoint = torch.load(str(weights), map_location=device, weights_only=True)
+    cfg = HeatmapEventNetConfig(**checkpoint["cfg"])
+    model = HeatmapEventNet(cfg).to(device).eval()
+    model.load_state_dict(checkpoint["state_dict"])
+    return model
 
 
 def _predict_heatmap(
@@ -318,172 +384,84 @@ def _interpolate(
     return {i: (float(spl_x(i)), float(spl_y(i))) for i in range(keys[0], keys[-1] + 1)}
 
 
-def _run_calibration(video_path: Path) -> CalibrationData:
-    """Single-pass calibration using unified seg model (table + person).
+def _run_eventnet_causal(
+    model: "HeatmapEventNet",
+    hm_cache: dict[int, NDArray[np.float32]],
+    all_positions: dict[int, tuple[float, float]],
+    net_cx_px: float,
+    device: torch.device,
+    threshold: float = EVENTNET_THRESHOLD,
+    dedup_frames: int = EVENTNET_DEDUP,
+) -> list[BounceEvent]:
+    """Slide a centered EN_WINDOW over sorted heatmap frames; bounce attributed to center."""
+    from eventnet.heatmap import HM_H, HM_W
 
-    Net mask and geometry are derived from the table mask centerline.
-    Falls back to defaults if model weights are missing.
-    """
-    if not SEG_WEIGHTS.exists():
-        print(f"  [calibration] {SEG_WEIGHTS} not found — using default geometry")
-        default_geo = NetGeometry()
-        return CalibrationData(
-            net_mask=np.zeros((TARGET_H, TARGET_W), dtype=np.uint8),
-            table_mask=np.ones((TARGET_H, TARGET_W), dtype=np.uint8),
-            net_geometry=default_geo,
-        )
+    frames = sorted(hm_cache.keys())
+    if len(frames) < EN_WINDOW:
+        return []
 
-    try:
-        print(f"Calibration — {SEG_WEIGHTS.name} …")
-        model = load_net_model(SEG_WEIGHTS)
-        seg_maps = compute_segmentation_maps(
-            video_path=video_path,
-            net_model=model,
-            n_frames=SEG_FRAMES,
-            target_w=TARGET_W,
-            target_h=TARGET_H,
-        )
+    empty = np.zeros((HM_H, HM_W), dtype=np.float32)
 
-        if seg_maps.table_mask is None:
-            raise RuntimeError("calibration failed: table not found")
+    hm_small: dict[int, NDArray[np.float32]] = {
+        fi: cv2.resize(hm, (HM_W, HM_H), interpolation=cv2.INTER_AREA).astype(np.float32)
+        for fi, hm in hm_cache.items()
+    }
 
-        kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE,
-            (2 * TABLE_MASK_MARGIN_PX + 1, 2 * TABLE_MASK_MARGIN_PX + 1),
-        )
-        table_mask = cv2.dilate(seg_maps.table_mask, kernel, iterations=1)
+    scores: dict[int, float] = {}
+    with torch.no_grad():
+        for i in range(EN_HALF, len(frames) - EN_HALF):
+            fi = frames[i]  # center frame — bounce is attributed here
+            window_frames = frames[i - EN_HALF: i + EN_HALF + 1]
+            window = np.stack(
+                [hm_small.get(f, empty) for f in window_frames],
+                axis=0,
+            )  # (EN_WINDOW, HM_H, HM_W)
+            tensor = torch.from_numpy(window).unsqueeze(0).to(device)
+            probs = torch.sigmoid(model(tensor)[0]).cpu().numpy()
+            scores[fi] = float(probs[0])  # bounce = idx 0
 
-        net_geometry = seg_maps.net_geometry
-
-        net_mask = _build_net_mask_from_table(table_mask)
-        if net_mask is None:
-            raise RuntimeError("calibration failed: net not found")
-        net_geometry = _net_geometry_from_mask(net_mask)
-        print("  [calibration] Net derived from table geometry")
-
-        return CalibrationData(
-            net_mask=net_mask,
-            table_mask=table_mask,
-            net_geometry=net_geometry,
-        )
-    except Exception as exc:
-        if isinstance(exc, RuntimeError) and str(exc).startswith("calibration failed:"):
-            raise
-        raise RuntimeError(f"calibration failed: {exc}") from exc
-
-
-def _net_geometry_from_mask(net_mask: np.ndarray) -> NetGeometry:
-    ys, xs = np.where(net_mask > 0)
-    if len(xs) == 0:
-        raise RuntimeError("calibration failed: net not found")
-    return NetGeometry(
-        cx=float(xs.mean()) / TARGET_W,
-        top_y=float(ys.min()) / TARGET_H,
-    )
-
-
-def _try_update_calibration(
-    model: "YOLO",
-    frame_bgr: np.ndarray,
-    conf: float = 0.25,
-    mask_threshold: float = 0.35,
-) -> CalibrationData | None:
-    """Run YOLO-seg on a single pre-resized (TARGET_H, TARGET_W) frame.
-
-    Returns updated CalibrationData, or None if table is not detected
-    (caller should keep the previous calibration in that case).
-    """
-    from eventnet.segmentation import _label_from_result
-
-    result = model(frame_bgr, conf=conf, verbose=False)[0]
-    table_acc = np.zeros((TARGET_H, TARGET_W), dtype=np.float32)
-    table_hits = 0
-
-    masks = getattr(result, "masks", None)
-    if masks is not None:
-        for det_idx, mask_tensor in enumerate(masks.data):
-            mask_np = mask_tensor.cpu().numpy()
-            m = cv2.resize(mask_np, (TARGET_W, TARGET_H), interpolation=cv2.INTER_LINEAR)
-            label = _label_from_result(result, det_idx)
-            if label in {"0", "table"}:
-                table_acc += (m > 0.5).astype(np.float32)
-                table_hits += 1
-
-    if table_hits == 0:
-        return None
-
-    table_raw = (table_acc / table_hits >= mask_threshold).astype(np.uint8)
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (2 * TABLE_MASK_MARGIN_PX + 1, 2 * TABLE_MASK_MARGIN_PX + 1),
-    )
-    table_mask = cv2.dilate(table_raw, kernel, iterations=1)
-
-    net_mask = _build_net_mask_from_table(table_mask)
-    if net_mask is None:
-        return None
-    net_geometry = _net_geometry_from_mask(net_mask)
-
-    return CalibrationData(
-        net_mask=net_mask,
-        table_mask=table_mask,
-        net_geometry=net_geometry,
-    )
-
-
-def _build_net_mask_from_table(table_mask: np.ndarray) -> np.ndarray | None:
-    ys, xs = np.where(table_mask > 0)
-    if len(xs) == 0:
-        return None
-
-    y_min = int(ys.min())
-    y_max = int(ys.max())
-    center_points: list[tuple[int, int]] = []
-
-    for y in range(y_min, y_max + 1):
-        row = np.where(table_mask[y] > 0)[0]
-        if len(row) < 2:
+    bounces: list[BounceEvent] = []
+    last_frame = -dedup_frames * 2
+    for fi, score in sorted(scores.items()):
+        if score < threshold:
             continue
-        x_left = int(row.min())
-        x_right = int(row.max())
-        x_mid = (x_left + x_right) // 2
-        center_points.append((x_mid, y))
+        if fi - last_frame < dedup_frames:
+            if bounces and score > bounces[-1].confidence:
+                cx, cy = all_positions.get(fi, (-1.0, -1.0))
+                bounces[-1] = BounceEvent(
+                    frame_idx=fi,
+                    side="left" if cx < net_cx_px else "right",
+                    cx=cx,
+                    cy=cy,
+                    confidence=score,
+                )
+                last_frame = fi
+            continue
 
-    if len(center_points) < 8:
-        return None
+        cx, cy = all_positions.get(fi, (-1.0, -1.0))
+        if cx < 0:
+            continue
+        bounces.append(BounceEvent(
+            frame_idx=fi,
+            side="left" if cx < net_cx_px else "right",
+            cx=cx,
+            cy=cy,
+            confidence=score,
+        ))
+        last_frame = fi
 
-    line_mask = np.zeros_like(table_mask, dtype=np.uint8)
-    for (x0, y0), (x1, y1) in zip(center_points, center_points[1:]):
-        cv2.line(line_mask, (x0, y0), (x1, y1), 1, 1, cv2.LINE_AA)
-
-    table_widths = []
-    for _, y in center_points[:: max(1, len(center_points) // 20)]:
-        row = np.where(table_mask[y] > 0)[0]
-        if len(row) >= 2:
-            table_widths.append(int(row.max()) - int(row.min()))
-
-    thickness = 6
-    if table_widths:
-        thickness = max(4, int(np.median(table_widths) * 0.035))
-
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (thickness, thickness))
-    net_mask = cv2.dilate(line_mask, kernel, iterations=1)
-    net_mask = ((net_mask > 0) & (table_mask > 0)).astype(np.uint8)
-    return net_mask if int(net_mask.sum()) > 0 else None
+    return bounces
 
 
 def _smooth_signal(values: NDArray[np.float32]) -> NDArray[np.float32]:
     n = len(values)
     if n < 5:
         return values.copy()
-
     window = min(TRAJ_SMOOTH_WINDOW, n if n % 2 == 1 else n - 1)
     if window < 5:
         return values.copy()
-
     poly = min(TRAJ_SMOOTH_POLY, window - 1)
-    smoothed = savgol_filter(values, window_length=window, polyorder=poly, mode="interp")
-    return smoothed.astype(np.float32)
+    return savgol_filter(values, window_length=window, polyorder=poly, mode="interp").astype(np.float32)
 
 
 def build_trajectory_series(
@@ -573,10 +551,65 @@ def detect_hits(
     return hits
 
 
+def detect_hits_from_bounces(
+    bounces: list[BounceEvent],
+    all_positions: dict[int, tuple[float, float]],
+    net_cx_px: float,
+) -> list[HitEvent]:
+    """Infer hits from consecutive bounces on opposite sides.
+
+    Between a bounce on side X (frame f0) and the next bounce on side Y (frame f1, X≠Y),
+    player X returned the ball. The hit is at the x-extremum of the trajectory in [f0, f1]:
+      - right player: maximum x (ball travels furthest right toward player)
+      - left player: minimum x (ball travels furthest left toward player)
+    """
+    if len(bounces) < 2:
+        return []
+
+    sorted_bounces = sorted(bounces, key=lambda b: b.frame_idx)
+    hits: list[HitEvent] = []
+
+    for i in range(len(sorted_bounces) - 1):
+        b0 = sorted_bounces[i]
+        b1 = sorted_bounces[i + 1]
+
+        if b0.side == b1.side:
+            continue  # double bounce same side — no return in between
+
+        hitter_side: Side = b0.side  # player on this side returns after the bounce
+        f0, f1 = b0.frame_idx, b1.frame_idx
+
+        frames_in = [f for f in all_positions if f0 < f < f1]
+        if len(frames_in) < 3:
+            continue
+
+        frames_arr = sorted(frames_in)
+        xs = np.array([all_positions[f][0] for f in frames_arr], dtype=np.float32)
+        ys = np.array([all_positions[f][1] for f in frames_arr], dtype=np.float32)
+
+        if hitter_side == "right":
+            hit_idx = int(np.argmax(xs))
+            if xs[hit_idx] <= net_cx_px:
+                continue  # extremum still on wrong side of net
+        else:
+            hit_idx = int(np.argmin(xs))
+            if xs[hit_idx] >= net_cx_px:
+                continue
+
+        hits.append(HitEvent(
+            frame_idx=frames_arr[hit_idx],
+            side=hitter_side,
+            cx=float(xs[hit_idx]),
+            cy=float(ys[hit_idx]),
+            confidence=float(abs(xs[hit_idx] - net_cx_px)),
+        ))
+
+    return hits
+
+
 def detect_bounces(
     traj: TrajectorySeries,
     net_cx_px: float,
-    table_mask: np.ndarray | None,
 ) -> list[BounceEvent]:
     bounces: list[BounceEvent] = []
     last_frame = -BOUNCE_DEDUP_FRAMES * 2
@@ -601,11 +634,6 @@ def detect_bounces(
             continue
         if cx <= 0.05 * TARGET_W or cx >= 0.95 * TARGET_W:
             continue
-        if table_mask is not None:
-            x_i = int(np.clip(round(cx), 0, TARGET_W - 1))
-            y_i = int(np.clip(round(cy), 0, TARGET_H - 1))
-            if table_mask[y_i, x_i] == 0:
-                continue
 
         frame_idx = traj.frames[i]
         if frame_idx - last_frame < BOUNCE_DEDUP_FRAMES:
@@ -640,12 +668,7 @@ def _filter_hits_near_bounces(
     radius_frames: int = 6,
 ) -> list[HitEvent]:
     bounce_frames = [b.frame_idx for b in bounces]
-    filtered: list[HitEvent] = []
-    for hit in hits:
-        if any(abs(hit.frame_idx - bf) <= radius_frames for bf in bounce_frames):
-            continue
-        filtered.append(hit)
-    return filtered
+    return [h for h in hits if not any(abs(h.frame_idx - bf) <= radius_frames for bf in bounce_frames)]
 
 
 def detect_net_events(
@@ -653,7 +676,6 @@ def detect_net_events(
     hits: list[HitEvent],
     bounces: list[BounceEvent],
     net_cx_px: float,
-    net_mask: np.ndarray | None,
 ) -> list[NetEvent]:
     nets: list[NetEvent] = []
     if not hits:
@@ -666,10 +688,7 @@ def detect_net_events(
 
     for idx, hit in enumerate(hits):
         next_hit_frame = hits[idx + 1].frame_idx if idx + 1 < len(hits) else traj.frames[-1] + 1
-        segment_bounces = [
-            b for b in bounces
-            if hit.frame_idx < b.frame_idx < next_hit_frame
-        ]
+        segment_bounces = [b for b in bounces if hit.frame_idx < b.frame_idx < next_hit_frame]
         if any(b.side == _other_side(hit.side) for b in segment_bounces):
             continue
 
@@ -697,17 +716,12 @@ def detect_net_events(
         near_dist = abs(near_x - net_cx_px)
         hit_to_net_progress = abs(net_cx_px - hit.cx)
         progress = abs(near_x - hit.cx)
-        near_on_net = False
-        if net_mask is not None:
-            x_i = int(np.clip(round(near_x), 0, TARGET_W - 1))
-            y_i = int(np.clip(round(near_y), 0, TARGET_H - 1))
-            near_on_net = bool(net_mask[y_i, x_i] > 0)
 
-        crossed = False
-        if hit.side == "left":
-            crossed = bool(np.max(seg_x) >= net_cx_px + cross_margin)
-        else:
-            crossed = bool(np.min(seg_x) <= net_cx_px - cross_margin)
+        crossed = (
+            bool(np.max(seg_x) >= net_cx_px + cross_margin)
+            if hit.side == "left"
+            else bool(np.min(seg_x) <= net_cx_px - cross_margin)
+        )
 
         reversal_near_net = False
         if 1 <= near_idx < len(seg_dx) - 1:
@@ -727,7 +741,7 @@ def detect_net_events(
         y_ok = NET_MIN_Y_RATIO * TARGET_H <= near_y <= NET_MAX_Y_RATIO * TARGET_H
         progress_ok = progress >= NET_MIN_PROGRESS_RATIO * max(hit_to_net_progress, 1.0)
         stagnated_before_cross = not crossed and progress_ok
-        candidate_near_net = (near_dist <= net_near_px and y_ok) or near_on_net
+        candidate_near_net = near_dist <= net_near_px and y_ok
 
         if crossed and not reversal_near_net and not same_side_bounce_near_net:
             continue
@@ -737,11 +751,8 @@ def detect_net_events(
             continue
         if any(abs(near_frame - b.frame_idx) <= 3 for b in segment_bounces):
             continue
-
         if near_frame - last_frame < NET_DEDUP_FRAMES:
             continue
-
-        # If there is a bounce at the same frame, prefer bounce over net.
         if near_frame in bounces_by_frame:
             continue
 
@@ -774,10 +785,7 @@ def detect_miss_events(
         target_side = _other_side(hit.side)
         next_hit_frame = hits[idx + 1].frame_idx if idx + 1 < len(hits) else traj.frames[-1] + 1
 
-        segment_bounces = [
-            b for b in bounces
-            if hit.frame_idx < b.frame_idx < next_hit_frame
-        ]
+        segment_bounces = [b for b in bounces if hit.frame_idx < b.frame_idx < next_hit_frame]
         if any(b.side == target_side for b in segment_bounces):
             continue
 
@@ -810,11 +818,9 @@ def detect_miss_events(
             continue
 
         crossed_idx = int(np.argmax(crossed_mask))
-        post_frames = seg_frames[crossed_idx:]
         post_x = seg_x[crossed_idx:]
         post_y = seg_y[crossed_idx:]
         post_returned = returned_mask[crossed_idx:]
-
         low_mask = post_y >= MISS_MAX_Y_RATIO * TARGET_H
         out_mask = (post_x <= out_margin) | (post_x >= TARGET_W - out_margin)
 
@@ -859,50 +865,15 @@ def merge_events(
     nets: list[NetEvent],
     misses: list[MissEvent],
 ) -> list[TrajectoryEvent]:
-    events = [
-        TrajectoryEvent(
-            frame_idx=h.frame_idx,
-            kind="hit",
-            side=h.side,
-            cx=h.cx,
-            cy=h.cy,
-            confidence=h.confidence,
-        )
-        for h in hits
-    ]
-    events.extend(
-        TrajectoryEvent(
-            frame_idx=b.frame_idx,
-            kind="bounce",
-            side=b.side,
-            cx=b.cx,
-            cy=b.cy,
-            confidence=b.confidence,
-        )
-        for b in bounces
-    )
-    events.extend(
-        TrajectoryEvent(
-            frame_idx=n.frame_idx,
-            kind="net",
-            side=n.side,
-            cx=n.cx,
-            cy=n.cy,
-            confidence=n.confidence,
-        )
-        for n in nets
-    )
-    events.extend(
-        TrajectoryEvent(
-            frame_idx=m.frame_idx,
-            kind="miss",
-            side=m.side,
-            cx=m.cx,
-            cy=m.cy,
-            confidence=m.confidence,
-        )
-        for m in misses
-    )
+    events: list[TrajectoryEvent] = []
+    for h in hits:
+        events.append(TrajectoryEvent(frame_idx=h.frame_idx, kind="hit", side=h.side, cx=h.cx, cy=h.cy, confidence=h.confidence))
+    for b in bounces:
+        events.append(TrajectoryEvent(frame_idx=b.frame_idx, kind="bounce", side=b.side, cx=b.cx, cy=b.cy, confidence=b.confidence))
+    for n in nets:
+        events.append(TrajectoryEvent(frame_idx=n.frame_idx, kind="net", side=n.side, cx=n.cx, cy=n.cy, confidence=n.confidence))
+    for m in misses:
+        events.append(TrajectoryEvent(frame_idx=m.frame_idx, kind="miss", side=m.side, cx=m.cx, cy=m.cy, confidence=m.confidence))
 
     priority = {"net": 0, "miss": 1, "bounce": 2, "hit": 3}
     events.sort(key=lambda e: (e.frame_idx, priority[e.kind]))
@@ -1008,8 +979,9 @@ _COLOR_POINT: tuple[int, int, int] = (50, 220, 80)
 _COLOR_SCORE_BG: tuple[int, int, int] = (25, 25, 25)
 _COLOR_HIT: tuple[int, int, int] = (80, 255, 180)
 _COLOR_BOUNCE: tuple[int, int, int] = (255, 220, 0)
-_COLOR_NET: tuple[int, int, int] = (0, 80, 230)
+_COLOR_NET_EVENT: tuple[int, int, int] = (0, 80, 230)
 _COLOR_MISS: tuple[int, int, int] = (40, 80, 255)
+_COLOR_NET_LINE: tuple[int, int, int] = (180, 180, 255)
 _RUSSIAN_VOICE = "Milena"
 
 
@@ -1019,17 +991,22 @@ def _draw_score_bar(frame: np.ndarray, fs: FrameScore) -> None:
     overlay = frame.copy()
     cv2.rectangle(overlay, (0, 0), (TARGET_W, bar_h), bg, -1)
     cv2.addWeighted(overlay, 0.82, frame, 0.18, 0, frame)
-
     score_text = f"{fs.left}  :  {fs.right}"
     (tw, _), _ = cv2.getTextSize(score_text, cv2.FONT_HERSHEY_DUPLEX, 0.90, 2)
     tx = (TARGET_W - tw) // 2
     cv2.putText(frame, score_text, (tx, bar_h - 10), cv2.FONT_HERSHEY_DUPLEX, 0.90, (255, 255, 255), 2, cv2.LINE_AA)
     cv2.putText(frame, "LEFT", (8, bar_h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.48, _COLOR_LEFT, 1, cv2.LINE_AA)
     cv2.putText(frame, "RIGHT", (TARGET_W - 56, bar_h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.48, _COLOR_RIGHT, 1, cv2.LINE_AA)
-
     if fs.event_label:
         cv2.putText(frame, fs.event_label.upper(), (10, TARGET_H - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 0, 0), 3, cv2.LINE_AA)
         cv2.putText(frame, fs.event_label.upper(), (10, TARGET_H - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 255, 255), 1, cv2.LINE_AA)
+
+
+def _draw_net_line(frame: np.ndarray, net_cx_px: float) -> None:
+    x = int(round(net_cx_px))
+    overlay = frame.copy()
+    cv2.line(overlay, (x, 0), (x, TARGET_H - 1), _COLOR_NET_LINE, 2, cv2.LINE_AA)
+    cv2.addWeighted(overlay, 0.35, frame, 0.65, 0, frame)
 
 
 def _draw_bounce_marker(frame: np.ndarray, b: BounceEvent, current_frame: int, fade_frames: int = 40) -> None:
@@ -1047,9 +1024,8 @@ def _draw_hit_marker(frame: np.ndarray, h: HitEvent, current_frame: int, fade_fr
     if age < 0 or age > fade_frames:
         return
     alpha = 1.0 - age / fade_frames
-    radius = max(5, int(12 * alpha))
     overlay = frame.copy()
-    cv2.circle(overlay, (int(h.cx), int(h.cy)), radius, _COLOR_HIT, 2, cv2.LINE_AA)
+    cv2.circle(overlay, (int(h.cx), int(h.cy)), max(5, int(12 * alpha)), _COLOR_HIT, 2, cv2.LINE_AA)
     cv2.addWeighted(overlay, alpha * 0.85, frame, 1 - alpha * 0.85, 0, frame)
 
 
@@ -1061,8 +1037,8 @@ def _draw_net_marker(frame: np.ndarray, n: NetEvent, current_frame: int, fade_fr
     overlay = frame.copy()
     pt = (int(n.cx), int(n.cy))
     size = max(7, int(14 * alpha))
-    cv2.line(overlay, (pt[0] - size, pt[1] - size), (pt[0] + size, pt[1] + size), _COLOR_NET, 2, cv2.LINE_AA)
-    cv2.line(overlay, (pt[0] - size, pt[1] + size), (pt[0] + size, pt[1] - size), _COLOR_NET, 2, cv2.LINE_AA)
+    cv2.line(overlay, (pt[0] - size, pt[1] - size), (pt[0] + size, pt[1] + size), _COLOR_NET_EVENT, 2, cv2.LINE_AA)
+    cv2.line(overlay, (pt[0] - size, pt[1] + size), (pt[0] + size, pt[1] - size), _COLOR_NET_EVENT, 2, cv2.LINE_AA)
     cv2.addWeighted(overlay, alpha * 0.90, frame, 1 - alpha * 0.90, 0, frame)
 
 
@@ -1103,36 +1079,15 @@ def _draw_ball(frame: np.ndarray, cx: float, cy: float, detected: bool) -> None:
     cv2.circle(frame, (int(cx), int(cy)), radius, (0, 0, 0), 1, cv2.LINE_AA)
 
 
-def _draw_net_mask(frame: np.ndarray, net_mask: np.ndarray | None) -> None:
-    if net_mask is None:
-        return
-    contours, _ = cv2.findContours(net_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    overlay = frame.copy()
-    overlay[net_mask > 0] = (180, 180, 255)
-    cv2.addWeighted(overlay, 0.18, frame, 0.82, 0, frame)
-    cv2.drawContours(frame, contours, -1, (180, 180, 255), 1, cv2.LINE_AA)
-
-
-def _draw_table_outline(
-    frame: np.ndarray,
-    table_mask: np.ndarray,
-) -> None:
-    contours, _ = cv2.findContours(table_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    overlay = frame.copy()
-    overlay[table_mask > 0] = (0, 128, 255)
-    cv2.addWeighted(overlay, 0.10, frame, 0.90, 0, frame)
-    cv2.drawContours(frame, contours, -1, (0, 180, 255), 1, cv2.LINE_AA)
-
-
 def _to_heatmap(hm: NDArray[np.float32]) -> np.ndarray:
     return cv2.applyColorMap((hm * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)  # type: ignore[return-value]
 
 
 def _extract_point_events(timeline: dict[int, FrameScore]) -> list[tuple[int, Side]]:
     return [
-        (frame_idx, frame_score.point_winner)
-        for frame_idx, frame_score in sorted(timeline.items())
-        if frame_score.point_winner is not None
+        (frame_idx, fs.point_winner)
+        for frame_idx, fs in sorted(timeline.items())
+        if fs.point_winner is not None
     ]
 
 
@@ -1142,15 +1097,12 @@ def _read_wav_pcm(path: Path) -> tuple[int, NDArray[np.float32]]:
         sample_rate = wf.getframerate()
         sample_width = wf.getsampwidth()
         frames = wf.readframes(wf.getnframes())
-
     if sample_width != 2:
         raise RuntimeError(f"Unsupported WAV sample width: {sample_width}")
-
     pcm = np.frombuffer(frames, dtype=np.int16)
     if channels > 1:
         pcm = pcm.reshape(-1, channels).mean(axis=1).astype(np.int16)
-    audio = pcm.astype(np.float32) / 32768.0
-    return sample_rate, audio
+    return sample_rate, pcm.astype(np.float32) / 32768.0
 
 
 def _write_wav_pcm(path: Path, sample_rate: int, audio: NDArray[np.float32]) -> None:
@@ -1179,50 +1131,18 @@ def _synthesize_score_audio(
 
     with tempfile.TemporaryDirectory(prefix="score_tts_") as tmp_dir_str:
         tmp_dir = Path(tmp_dir_str)
-        wav_paths: dict[Side, Path] = {
-            "left": tmp_dir / "left.wav",
-            "right": tmp_dir / "right.wav",
-        }
-
         phrase_audio: dict[Side, NDArray[np.float32]] = {}
         sample_rate = 22_050
 
         for side, text in phrases.items():
             aiff_path = tmp_dir / f"{side}.aiff"
-            subprocess.run(
-                [
-                    "say",
-                    "-v",
-                    _RUSSIAN_VOICE,
-                    "-o",
-                    str(aiff_path),
-                    text,
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            subprocess.run(
-                [
-                    "ffmpeg",
-                    "-y",
-                    "-i",
-                    str(aiff_path),
-                    "-ac",
-                    "1",
-                    "-ar",
-                    str(sample_rate),
-                    str(wav_paths[side]),
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            sample_rate, phrase_audio[side] = _read_wav_pcm(wav_paths[side])
+            wav_path = tmp_dir / f"{side}.wav"
+            subprocess.run(["say", "-v", _RUSSIAN_VOICE, "-o", str(aiff_path), text], check=True, capture_output=True, text=True)
+            subprocess.run(["ffmpeg", "-y", "-i", str(aiff_path), "-ac", "1", "-ar", str(sample_rate), str(wav_path)], check=True, capture_output=True, text=True)
+            sample_rate, phrase_audio[side] = _read_wav_pcm(wav_path)
 
         total_samples = int((total_frames / fps) * sample_rate) + sample_rate
         mixed = np.zeros(total_samples, dtype=np.float32)
-
         for frame_idx, winner in point_events:
             clip = phrase_audio[winner]
             start = int((frame_idx / fps) * sample_rate)
@@ -1246,103 +1166,18 @@ def _attach_score_audio(
         return
 
     with tempfile.TemporaryDirectory(prefix="score_mux_") as tmp_dir_str:
-        tmp_dir = Path(tmp_dir_str)
-        wav_path = tmp_dir / "score_audio.wav"
+        wav_path = Path(tmp_dir_str) / "score_audio.wav"
         created = _synthesize_score_audio(point_events, fps, total_frames, wav_path)
         if not created:
             silent_video.replace(output_video)
             return
-
         subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-i",
-                str(silent_video),
-                "-i",
-                str(wav_path),
-                "-c:v",
-                "copy",
-                "-c:a",
-                "aac",
-                "-shortest",
-                str(output_video),
-            ],
+            ["ffmpeg", "-y", "-i", str(silent_video), "-i", str(wav_path), "-c:v", "copy", "-c:a", "aac", "-shortest", str(output_video)],
             check=True,
             capture_output=True,
             text=True,
         )
     silent_video.unlink(missing_ok=True)
-
-
-def _run_eventnet(
-    hm_cache: dict[int, NDArray[np.float32]],
-    all_positions: dict[int, tuple[float, float]],
-    net_cx_px: float,
-    weights: Path,
-    device: torch.device,
-    threshold: float = EVENTNET_THRESHOLD,
-    window_size: int = 15,
-    dedup_frames: int = EVENTNET_DEDUP,
-) -> tuple[list[HitEvent], list[BounceEvent]]:
-    """Slide EventNet over cached TrackNet heatmaps → hit + bounce event lists.
-
-    Heatmaps are downscaled from (360, 640) to EventNet's (36, 64).
-    Missing frames (between INFER_STEP detections) are zeroed — consistent
-    with the 50 % heatmap dropout used during training.
-    """
-    from eventnet.heatmap import HM_H, HM_W
-    from eventnet.model import HeatmapEventNet, HeatmapEventNetConfig
-
-    checkpoint = torch.load(str(weights), map_location=device, weights_only=True)
-    cfg = HeatmapEventNetConfig(**checkpoint["cfg"])
-    model = HeatmapEventNet(cfg).to(device).eval()
-    model.load_state_dict(checkpoint["state_dict"])
-
-    frames = sorted(hm_cache.keys())
-    half = window_size // 2
-    empty = np.zeros((HM_H, HM_W), dtype=np.float32)
-
-    hm_small: dict[int, NDArray[np.float32]] = {
-        fi: cv2.resize(hm, (HM_W, HM_H), interpolation=cv2.INTER_AREA).astype(np.float32)
-        for fi, hm in hm_cache.items()
-    }
-
-    bounce_scores: dict[int, float] = {}
-
-    with torch.no_grad():
-        for i in range(half, len(frames) - half):
-            fi = frames[i]
-            window_frames = frames[i - half: i + half + 1]
-            window = np.stack(
-                [hm_small.get(f, empty) for f in window_frames],
-                axis=0,
-            )  # (window_size, HM_H, HM_W)
-            tensor = torch.from_numpy(window).unsqueeze(0).to(device)
-            probs = torch.sigmoid(model(tensor)[0]).cpu().numpy()
-            bounce_scores[fi] = float(probs[0])  # bounce = idx 0
-
-    def _peak_pick(scores: dict[int, float]) -> list[tuple[int, float]]:
-        peaks: list[tuple[int, float]] = []
-        for fi, score in sorted(scores.items()):
-            if score < threshold:
-                continue
-            if peaks and fi - peaks[-1][0] < dedup_frames:
-                if score > peaks[-1][1]:
-                    peaks[-1] = (fi, score)
-            else:
-                peaks.append((fi, score))
-        return peaks
-
-    bounces: list[BounceEvent] = []
-    for fi, conf in _peak_pick(bounce_scores):
-        cx, cy = all_positions.get(fi, (-1.0, -1.0))
-        if cx < 0:
-            continue
-        side: Side = "left" if cx < net_cx_px else "right"
-        bounces.append(BounceEvent(frame_idx=fi, side=side, cx=cx, cy=cy, confidence=conf))
-
-    return [], bounces
 
 
 def run(video_path: Path, output: Path) -> None:
@@ -1354,19 +1189,29 @@ def run(video_path: Path, output: Path) -> None:
     print(f"Device: {device}")
 
     tracknet = _load_tracknet(TRACKNET_WEIGHTS, device)
+    net_cx_px = NET_CX_RATIO * TARGET_W
+
+    en_model: HeatmapEventNet | None = None
+    if EVENTNET_WEIGHTS.exists():
+        en_model = _load_eventnet(EVENTNET_WEIGHTS, device)
+        print(f"EventNet: {EVENTNET_WEIGHTS.name}")
+    else:
+        print("EventNet: not found — trajectory bounces only")
+
+    seg_model: YOLO | None = None
+    if SEG_WEIGHTS.exists():
+        seg_model = _load_seg_model(SEG_WEIGHTS)
+        print(f"Seg model: {SEG_WEIGHTS.name}")
+    else:
+        print(f"Seg model: {SEG_WEIGHTS} not found — no segmentation overlay")
 
     cap = cv2.VideoCapture(str(video_path))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS)
     cap.release()
 
-    seg_model = load_net_model(SEG_WEIGHTS) if SEG_WEIGHTS.exists() else None
-    calibration = _run_calibration(video_path)
-    table_mask = calibration.table_mask
-    net_mask   = calibration.net_mask
-    net_cx_px  = calibration.net_geometry.cx * TARGET_W
-
-    print(f"Pass 1 — TrackNet on {total} frames…")
+    # --- Pass 1: streaming TrackNet ---
+    print(f"Pass 1 — TrackNet on {total} frames …")
     detections: dict[int, tuple[float, float]] = {}
     hm_cache: dict[int, NDArray[np.float32]] = {}
     frame_buffer: list[NDArray[np.float32]] = []
@@ -1377,20 +1222,13 @@ def run(video_path: Path, output: Path) -> None:
         if not ret:
             break
 
-        if fi % SEG_INTERVAL == 0 and fi > 0 and seg_model is not None:
-            frame_bgr = cv2.resize(raw, (TARGET_W, TARGET_H))
-            updated = _try_update_calibration(seg_model, frame_bgr)
-            if updated is not None:
-                table_mask = updated.table_mask
-                net_mask   = updated.net_mask
-                net_cx_px  = updated.net_geometry.cx * TARGET_W
-
         small = cv2.resize(raw, (TARGET_W, TARGET_H)).astype(np.float32) / 255.0
         frame_buffer.append(small)
         if len(frame_buffer) > 3:
             frame_buffer.pop(0)
         while len(frame_buffer) < 3:
             frame_buffer.insert(0, frame_buffer[0])
+
         if fi % INFER_STEP == 0:
             cx, cy, hm = _predict_heatmap(tracknet, frame_buffer[-3:], device)
             hm_cache[fi] = hm
@@ -1401,46 +1239,43 @@ def run(video_path: Path, output: Path) -> None:
     all_positions = _interpolate(detections)
     print(f"  detected {len(detections)} / interpolated {len(all_positions)} frames")
 
+    # --- Event detection ---
+    print("Detecting events …")
     traj = build_trajectory_series(all_positions)
     if traj is None:
         raise RuntimeError("Not enough tracked points to score the video.")
 
-    print("Pass 2 — event detection…")
-    bounces = detect_bounces(traj, net_cx_px, table_mask)
+    traj_bounces = detect_bounces(traj, net_cx_px)
 
-    if EVENTNET_WEIGHTS.exists():
-        print(f"  EventNet ({EVENTNET_WEIGHTS.name}) …")
-        en_hits, en_bounces = _run_eventnet(hm_cache, all_positions, net_cx_px, EVENTNET_WEIGHTS, device)
-        hits = en_hits if en_hits else detect_hits(traj, net_cx_px)
-        if en_bounces:
-            bounces = en_bounces
-        print(f"  EventNet: {len(hits)} hits, {len(bounces)} bounces")
+    if en_model is not None:
+        en_bounces = _run_eventnet_causal(en_model, hm_cache, all_positions, net_cx_px, device)
+        print(f"  EventNet bounces: {len(en_bounces)}  traj bounces: {len(traj_bounces)}")
+        bounces = en_bounces if en_bounces else traj_bounces
     else:
-        hits = detect_hits(traj, net_cx_px)
-        print(f"  Trajectory heuristics (no EventNet weights)")
+        bounces = traj_bounces
+        print(f"  traj bounces: {len(bounces)}")
 
-    hits  = _filter_hits_near_bounces(hits, bounces)
-    nets  = detect_net_events(traj, hits, bounces, net_cx_px, net_mask)
+    print(f"  dx range: [{traj.dx.min():.2f}, {traj.dx.max():.2f}]  net_cx_px: {net_cx_px:.1f}")
+
+    hits = detect_hits_from_bounces(bounces, all_positions, net_cx_px)
+    if not hits:
+        hits = detect_hits(traj, net_cx_px)
+    hits = _filter_hits_near_bounces(hits, bounces)
+    nets = detect_net_events(traj, hits, bounces, net_cx_px)
     misses = detect_miss_events(traj, hits, bounces, net_cx_px)
     events = merge_events(hits, bounces, nets, misses)
 
-    print(f"  hits:    {len(hits)}")
-    print(f"  bounces: {len(bounces)}")
-    print(f"  nets:    {len(nets)}")
-    print(f"  misses:  {len(misses)}")
-    for event in events:
-        print(
-            f"    frame {event.frame_idx:5d}  "
-            f"{event.kind:6s}  side={event.side:5s}  "
-            f"cx={event.cx:6.1f}  cy={event.cy:6.1f}"
-        )
+    print(f"  hits: {len(hits)}  bounces: {len(bounces)}  nets: {len(nets)}  misses: {len(misses)}")
+    for ev in events:
+        print(f"    frame {ev.frame_idx:5d}  {ev.kind:6s}  side={ev.side:5s}  cx={ev.cx:6.1f}  cy={ev.cy:6.1f}")
 
-    print("Pass 3 — scoring…")
+    # --- Scoring ---
     timeline = build_score_timeline(events, detections, total)
     final = timeline.get(total - 1, FrameScore())
     print(f"  Final score: LEFT {final.left} : RIGHT {final.right}")
 
-    print("Pass 4 — rendering…")
+    # --- Pass 2: render ---
+    print("Pass 2 — rendering …")
     silent_output = output.with_name(f"{output.stem}.silent.mp4")
     writer = cv2.VideoWriter(
         str(silent_output),
@@ -1480,8 +1315,14 @@ def run(video_path: Path, output: Path) -> None:
         for miss in misses:
             _draw_miss_marker(left, miss, fi)
 
-        _draw_net_mask(left, net_mask)
-        _draw_table_outline(left, table_mask)
+        if seg_model is not None:
+            table_mask, person_mask = _predict_seg_masks(seg_model, left)
+            if table_mask is not None:
+                _draw_table_mask(left, table_mask)
+            if person_mask is not None:
+                _draw_person_mask(left, person_mask)
+
+        _draw_net_line(left, net_cx_px)
         _draw_score_bar(left, timeline.get(fi, FrameScore()))
 
         right = _to_heatmap(heatmap)
