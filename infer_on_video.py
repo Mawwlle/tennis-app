@@ -11,15 +11,14 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
-import torch.nn.functional as F
 from numpy.typing import NDArray
 from scipy.interpolate import make_interp_spline
 from tqdm import tqdm
 
 from eventnet.dataset import IDX_TO_LABEL
-from eventnet.features import NetGeometry, extract_features
-from eventnet.model import TCNEventNet, TCNEventNetConfig
-from eventnet.player_detection import PlayerGeometry, compute_player_geometry
+from eventnet.features import NetGeometry
+from eventnet.heatmap import positions_to_heatmaps
+from eventnet.model import HeatmapEventNet, HeatmapEventNetConfig
 from eventnet.segmentation import compute_net_geometry, load_net_model
 from tracknet.model import TrackNet
 
@@ -53,21 +52,19 @@ _EVENT_COLORS: dict[str, tuple[int, int, int]] = {
 def load_tracknet(weights: Path, device: torch.device) -> TrackNet:
     model = TrackNet()
     model.load_state_dict(torch.load(str(weights), map_location=device, weights_only=True))
-    model.to(device).eval()
-    return model
+    return model.to(device).eval()
 
 
 def load_eventnet(
     weights: Path,
     device: torch.device,
-) -> tuple[TCNEventNet, TCNEventNetConfig] | None:
+) -> tuple[HeatmapEventNet, HeatmapEventNetConfig] | None:
     if not weights.exists():
         return None
-    checkpoint: dict[str, object] = torch.load(str(weights), map_location=device, weights_only=True)
-    cfg = TCNEventNetConfig(**checkpoint["cfg"])  # type: ignore[arg-type]
-    model = TCNEventNet(cfg)
-    model.load_state_dict(checkpoint["state_dict"])  # type: ignore[arg-type]
-    model.to(device).eval()
+    checkpoint = torch.load(str(weights), map_location=device, weights_only=True)
+    cfg = HeatmapEventNetConfig(**checkpoint["cfg"])
+    model = HeatmapEventNet(cfg).to(device).eval()
+    model.load_state_dict(checkpoint["state_dict"])
     return model, cfg
 
 
@@ -149,14 +146,12 @@ def interpolate_positions(
 
 
 def classify_events(
-    model: TCNEventNet,
-    cfg: TCNEventNetConfig,
+    model: HeatmapEventNet,
+    cfg: HeatmapEventNetConfig,
     all_positions: dict[int, tuple[float, float]],
-    net_geometry: NetGeometry,
     device: torch.device,
-    player_geometry: PlayerGeometry | None = None,
 ) -> dict[int, tuple[str, float]]:
-    """Classify game events using a sliding window of kinematic + geometry features."""
+    """Classify game events using HeatmapEventNet over a sliding window of Gaussian heatmaps."""
     half = cfg.window_size // 2
     all_frames = sorted(all_positions)
     results: dict[int, tuple[str, float]] = {}
@@ -167,11 +162,11 @@ def classify_events(
             if idx in all_positions else None
             for idx in range(center - half, center + half + 1)
         )
-        feats = extract_features(positions, net_geometry, player_geometry)  # (N, 14)
-        tensor = torch.from_numpy(feats.T).unsqueeze(0).to(device)          # (1, 14, N)
+        heatmaps = positions_to_heatmaps(positions)                     # (W, HM_H, HM_W)
+        tensor = torch.from_numpy(heatmaps).unsqueeze(0).to(device)    # (1, W, HM_H, HM_W)
 
         with torch.no_grad():
-            probs = F.softmax(model(tensor), dim=1)[0]
+            probs = torch.sigmoid(model(tensor))[0]
 
         label_idx = int(probs.argmax().item())
         results[center] = (IDX_TO_LABEL[label_idx], float(probs[label_idx].item()))
@@ -274,16 +269,8 @@ def run(weights: Path, video_path: Path, output: Path) -> None:
     fps   = cap.get(cv2.CAP_PROP_FPS)
     cap.release()
 
-    # ── Pass 0: net geometry + player positions ───────────────────────────────
+    # ── Pass 0: net geometry ──────────────────────────────────────────────────
     net_geometry = estimate_net_geometry(video_path)
-
-    player_geometry: PlayerGeometry | None = None
-    if event_loaded is not None:
-        try:
-            player_geometry = compute_player_geometry(video_path, n_frames=60)
-            print(f"Players: left=({player_geometry.left_cx:.2f},{player_geometry.left_cy:.2f})  right=({player_geometry.right_cx:.2f},{player_geometry.right_cy:.2f})")
-        except Exception as exc:
-            print(f"Player detection failed ({exc}) — using defaults")
 
     # ── Pass 1: detect + interpolate ──────────────────────────────────────────
     print(f"Pass 1 — TrackNet on {total} frames…")
@@ -322,9 +309,7 @@ def run(weights: Path, video_path: Path, output: Path) -> None:
             model=event_model,
             cfg=event_cfg,
             all_positions=all_positions,
-            net_geometry=net_geometry,
             device=device,
-            player_geometry=player_geometry,
         )
 
     # ── Pass 3: render ────────────────────────────────────────────────────────
