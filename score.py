@@ -38,7 +38,7 @@ if TYPE_CHECKING:
     from eventnet.model import HeatmapEventNet
     from ultralytics import YOLO
 
-VIDEO_PATH       = Path("test_3.mp4")
+VIDEO_PATH       = Path("for_tennis_infer.mp4")
 TRACKNET_WEIGHTS = Path("weights/tracknet_best.pt")
 EVENTNET_WEIGHTS = Path("weights/eventnet_best.pt")
 SEG_WEIGHTS      = Path("weights/seg_best.pt")

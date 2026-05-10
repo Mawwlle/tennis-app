@@ -28,8 +28,12 @@ dependencies = [
 train = "train_tracknet:entrypoint"
 train-events = "train_eventnet:entrypoint"
 train-seg = "train_seg:entrypoint"
+prepare-yolo-dataset = "prepare_yolo_dataset:entrypoint"
+train-det = "train_det:entrypoint"
+train-yolo = "train_yolo_det:entrypoint"
 segment = "segment_video:main"
 score = "score:main"
+score-yolo = "score_yolo:main"
 infer = "infer_on_video:main"
 webapp = "main:main"
 

@@ -1,0 +1,43 @@
+# macOS
+.DS_Store
+
+# Android Studio / IntelliJ
+.idea/
+*.iml
+
+# Gradle
+.gradle/
+build/
+app/build/
+
+# Local machine config
+local.properties
+
+# Generated release artifacts
+app/release/
+*.apk
+*.aab
+*.ap_
+*.idsig
+output-metadata.json
+
+# Signing material: never commit keystores or passwords
+*.jks
+*.keystore
+keystore.properties
+signing.properties
+
+# Runtime/profiling/temp output
+tmp_profiles/
+captures/
+*.hprof
+*.prof
+*.trace
+*.log
+
+# Large local test media
+app/src/main/assets/mock_videos/
+
+# Generated preview/store icon exports.
+# The app icon source lives in res/drawable and res/mipmap-*.
+app_icon_*.png
