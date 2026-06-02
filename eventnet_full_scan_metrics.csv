@@ -1,0 +1,2 @@
+game,weights,smooth_radius,bounce_events,samples,skipped_centers,TP,FP,TN,FN,accuracy,precision,recall,f1
+test_2,weights/eventnet_best.pt,3,28,770,2366,192,58,516,4,0.9195,0.7680,0.9796,0.8610

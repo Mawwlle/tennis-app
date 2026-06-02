@@ -17,7 +17,7 @@ from tqdm import tqdm
 from ultralytics import YOLO  # type: ignore[reportPrivateImportUsage]
 
 VIDEO_PATH = Path("test_7.mp4")
-NET_WEIGHTS = Path("weights/seg_best.pt")
+NET_WEIGHTS = Path("yolo_seg.pt")
 OUTPUT = Path("seg_result.mp4")
 
 TARGET_W = 640

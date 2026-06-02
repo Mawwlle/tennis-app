@@ -38,6 +38,7 @@ class GameFragment : Fragment() {
     private var cameraProvider: ProcessCameraProvider? = null
     private var analysisExecutor: ExecutorService? = null
     private var detector: YoloQnnDetector? = null
+    private var eventNetDetector: EventNetBounceDetector? = null
     private val gameState = GameState()
     private val mainHandler = Handler(Looper.getMainLooper())
     private val trailPoints = ArrayDeque<TrailPoint>()
@@ -72,6 +73,7 @@ class GameFragment : Fragment() {
     )
 
     private val modelAssetName = "yolo_det.onnx"
+    private val eventNetAssetName = "eventnet_best.onnx"
     private val analysisSize = Size(320, 180)
     private val trailWindow = 18
     private val maxExtrapMs = 220L
@@ -143,7 +145,7 @@ class GameFragment : Fragment() {
                     binding.calibrationOverlay.mode = CalibrationOverlayView.Mode.HIDDEN
                     binding.calibrationPanel.visibility = View.GONE
                     calibrationStep = CalibrationStep.READY
-                    speak("Начало партии всегда за левым на экране игроком. Игрок можете начинать")
+                    speak(serverText(GameState.Side.LEFT))
                 }
                 CalibrationStep.READY -> Unit
             }
@@ -207,6 +209,13 @@ class GameFragment : Fragment() {
             detector = null
             Toast.makeText(requireContext(), "ONNX init error: ${e.message}", Toast.LENGTH_LONG).show()
         }
+        try {
+            eventNetDetector = EventNetBounceDetector(requireContext(), eventNetAssetName)
+        } catch (e: Exception) {
+            eventNetDetector?.close()
+            eventNetDetector = null
+            Toast.makeText(requireContext(), "EventNet init error: ${e.message}", Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun setupTextToSpeech() {
@@ -238,9 +247,11 @@ class GameFragment : Fragment() {
             GameState.Side.RIGHT -> "Очко правому игроку"
             null -> return
         }
-        val server = if ((score.left + score.right) % 2 == 0) GameState.Side.LEFT else GameState.Side.RIGHT
-        val serverText = if (server == GameState.Side.LEFT) "Подаёт левый игрок" else "Подаёт правый игрок"
-        speak("$winnerText. $serverText")
+        speak("$winnerText. ${serverText(score.server)}")
+    }
+
+    private fun serverText(server: GameState.Side): String {
+        return if (server == GameState.Side.LEFT) "Подача левого игрока" else "Подача правого игрока"
     }
 
     private fun hasCameraPermission(): Boolean {
@@ -363,6 +374,24 @@ class GameFragment : Fragment() {
             null
         }
 
+        val eventNetBounce = if (detection != null) {
+            eventNetDetector?.addDetection(
+                frame = frame,
+                cx = detection.cx,
+                cy = detection.cy,
+                width = modelWidth,
+                height = modelHeight,
+                netX = gameState.currentNetX()
+            )
+        } else {
+            eventNetDetector?.addMissingFrame(
+                frame = frame,
+                width = modelWidth,
+                height = modelHeight,
+                netX = gameState.currentNetX()
+            )
+        }
+
         val snapshot = if (detection != null) {
             gameState.addDetection(
                 GameState.Detection(
@@ -370,10 +399,11 @@ class GameFragment : Fragment() {
                     cx = detection.cx,
                     cy = detection.cy,
                     confidence = inference.confidence
-                )
+                ),
+                eventNetBounce = eventNetBounce
             )
         } else {
-            gameState.addMissingFrame(frame)
+            gameState.addMissingFrame(frame, eventNetBounce = eventNetBounce)
         }
         if (detection != null) {
             updateTracking(detection)
@@ -485,6 +515,7 @@ class GameFragment : Fragment() {
         lastDetectionAtMs = 0L
         lastAnnouncedLeftScore = 0
         lastAnnouncedRightScore = 0
+        eventNetDetector?.reset()
         gameState.reset()
     }
 
@@ -611,6 +642,8 @@ class GameFragment : Fragment() {
         resetTrackingState()
         detector?.close()
         detector = null
+        eventNetDetector?.close()
+        eventNetDetector = null
         textToSpeech?.stop()
         textToSpeech?.shutdown()
         textToSpeech = null

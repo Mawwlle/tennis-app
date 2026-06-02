@@ -36,6 +36,7 @@ score = "score:main"
 score-yolo = "score_yolo:main"
 infer = "infer_on_video:main"
 webapp = "main:main"
+visualize-csv = "visualize_openttgames_csv:entrypoint"
 
 [tool.uv.sources]
 synth-client = { git = "https://gitlab.actcognitive.org/Mawlle/synth.git", subdirectory = "synth-client" }

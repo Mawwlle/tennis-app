@@ -1,0 +1,2 @@
+game,video,weights,samples,visible_samples,absent_samples,heatmap_mse,visible_heatmap_mse,absent_heatmap_mse,coord_mse_px2,coord_rmse_px
+test_2,dataset/openttgames/test_2/test_2.mp4,weights/tracknet_best.pt,779,773,6,0.00049458,0.00049283,0.00072110,442.03,21.02

@@ -1,0 +1,2 @@
+game,video,weights,samples,visible_samples,absent_samples,heatmap_mse,visible_heatmap_mse,absent_heatmap_mse,coord_mse_px2,coord_rmse_px
+test_7,test_7.mp4,weights/tracknet_best.pt,226,192,34,0.00096830,0.00099283,0.00082981,38610.65,196.50

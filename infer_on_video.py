@@ -22,7 +22,7 @@ from eventnet.model import HeatmapEventNet, HeatmapEventNetConfig
 from eventnet.segmentation import compute_net_geometry, load_net_model
 from tracknet.model import TrackNet
 
-VIDEO_PATH       = Path("for_tennis_infer.mp4")
+VIDEO_PATH       = Path("/Users/mawwlle/Downloads/profi_tennis.mp4")
 WEIGHTS          = Path("weights/tracknet_best.pt")
 EVENTNET_WEIGHTS = Path("weights/eventnet_best.pt")
 NET_SEG_WEIGHTS  = Path("weights/seg_best.pt")

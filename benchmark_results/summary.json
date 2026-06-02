@@ -1,0 +1,59 @@
+{
+  "environment": {
+    "platform": "macOS-26.4.1-arm64-arm-64bit",
+    "python": "3.12.12",
+    "onnxruntime": "1.24.3",
+    "provider": "CPUExecutionProvider",
+    "available_providers": [
+      "CoreMLExecutionProvider",
+      "AzureExecutionProvider",
+      "CPUExecutionProvider"
+    ],
+    "video": "dataset/videos/night_videos/part_1.mp4",
+    "runs": 5,
+    "frames": 300,
+    "warmup": 20
+  },
+  "models": [
+    {
+      "model": "TrackNet",
+      "runs": 5,
+      "frames_per_run": 300,
+      "mean_latency_ms": 32.48849072066667,
+      "std_latency_ms": 8.23341264977634,
+      "p50_latency_ms": 30.390604,
+      "p90_latency_ms": 39.823600000000006,
+      "p95_latency_ms": 45.95133749999999,
+      "p99_latency_ms": 60.42558508,
+      "min_latency_ms": 20.248167,
+      "max_latency_ms": 153.557417,
+      "mean_rss_mb": 3321.57825,
+      "std_rss_mb": 730.2164413708738,
+      "peak_rss_mb": 4244.28125,
+      "mean_rss_delta_mb": 391.2345,
+      "std_rss_delta_mb": 730.2164413708738,
+      "peak_rss_delta_mb": 1313.9375,
+      "session_load_rss_mb": 9.375
+    },
+    {
+      "model": "YOLO",
+      "runs": 5,
+      "frames_per_run": 300,
+      "mean_latency_ms": 64.60953744666666,
+      "std_latency_ms": 12.506907918210324,
+      "p50_latency_ms": 63.342375000000004,
+      "p90_latency_ms": 71.5113039,
+      "p95_latency_ms": 79.27347354999999,
+      "p99_latency_ms": 111.12550632999998,
+      "min_latency_ms": 47.1345,
+      "max_latency_ms": 343.862125,
+      "mean_rss_mb": 2844.4041041666665,
+      "std_rss_mb": 314.4594384330693,
+      "peak_rss_mb": 3362.3125,
+      "mean_rss_delta_mb": 285.4041041666667,
+      "std_rss_delta_mb": 314.4594384330693,
+      "peak_rss_delta_mb": 803.3125,
+      "session_load_rss_mb": 32.59375
+    }
+  ]
+}
