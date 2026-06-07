@@ -38,11 +38,15 @@ if TYPE_CHECKING:
     from eventnet.model import HeatmapEventNet
     from ultralytics import YOLO
 
-VIDEO_PATH       = Path("/Users/mawwlle/Downloads/profi_tennis.mp4")
+VIDEO_PATH       = Path("for_tennis_infer.mp4")
 TRACKNET_WEIGHTS = Path("weights/tracknet_best.pt")
 EVENTNET_WEIGHTS = Path("weights/eventnet_best.pt")
 SEG_WEIGHTS      = Path("weights/seg_best.pt")
 OUTPUT           = Path("score_result.mp4")
+
+if not VIDEO_PATH.exists():
+    print("Отсутствует видео для инференса!")
+    raise Exception("ПОЖАЛУЙСТА, скачайте видео for_tennis_infer.mp4 и положите его в корень проекта")
 
 NET_CX_RATIO = 0.50   # net centre as fraction of frame width
 
