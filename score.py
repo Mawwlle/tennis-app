@@ -1336,7 +1336,7 @@ def run(video_path: Path, output: Path) -> None:
 
     cap.release()
     writer.release()
-    _attach_score_audio(silent_output, output, timeline, fps, total)
+    # _attach_score_audio(silent_output, output, timeline, fps, total)
     print(f"Saved -> {output}")
 
 
